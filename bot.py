@@ -972,28 +972,51 @@ class SiteBot:
 # ---------------------------------------------------------------------------
 
 def connect_to_chrome(port=None):
-    # Resolve port: explicit arg > env > config
+    # Try debuggerAddress first (for manual chrome), fallback to launching new chrome
     if port is None:
         try:
             port = int(os.environ.get("CHROME_PORT", os.environ.get("DEBUGGER_PORT", "")) or getattr(cfg, "DEBUGGER_PORT", getattr(cfg, "CHROME_DEBUG_PORT", 9222)))
         except Exception:
             port = 9222
+
+    # Attempt 1: connect to existing chrome on debugger port
+    opts_dbg = Options()
+    opts_dbg.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+    opts_dbg.add_argument("--no-sandbox")
+    opts_dbg.add_argument("--disable-dev-shm-usage")
+    chromedriver_path = getattr(cfg, "CHROMEDRIVER_PATH", None)
+    try:
+        if chromedriver_path and os.path.exists(chromedriver_path):
+            service = Service(executable_path=chromedriver_path)
+            driver = webdriver.Chrome(service=service, options=opts_dbg)
+        else:
+            driver = webdriver.Chrome(options=opts_dbg)
+        log(f"Connected to existing Chrome on port {port}", "ok")
+        return driver
+    except WebDriverException as e:
+        log(f"No existing Chrome on port {port}: {e} — launching new Chrome", "warn")
+
+    # Attempt 2: launch new chrome directly (visible via Xvfb DISPLAY=:99)
     opts = Options()
-    opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    # Also try Service if CHROMEDRIVER_PATH is set (compat with legacy)
-    chromedriver_path = getattr(cfg, "CHROMEDRIVER_PATH", None)
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--remote-allow-origins=*")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--disable-extensions")
+    # ensure we use a fresh profile
+    opts.add_argument("--user-data-dir=/tmp/chrome-bot-profile")
     try:
         if chromedriver_path and os.path.exists(chromedriver_path):
             service = Service(executable_path=chromedriver_path)
             driver = webdriver.Chrome(service=service, options=opts)
         else:
             driver = webdriver.Chrome(options=opts)
-        log(f"Connected to Chrome on port {port}", "ok")
+        log(f"Launched new Chrome (visible via VNC :99)", "ok")
         return driver
     except WebDriverException as e:
-        log(f"Cannot connect to Chrome on port {port}: {e}", "error")
+        log(f"Failed to launch Chrome: {e}", "error")
         return None
 
 
