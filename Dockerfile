@@ -12,8 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     novnc \
     websockify \
     supervisor \
-    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
+    ca-certificates \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends google-chrome-stable \
     && CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+') \
@@ -42,9 +44,9 @@ VOLUME ["/app/data", "/app/logs"]
 EXPOSE 9222 5900 6080
 
 ENTRYPOINT ["/bin/bash", "-c", "\
-    Xvfb :99 -screen 0 1920x1080x24 &\
-    && x11vnc -display :99 -forever -nopw -rfbport 5900 &\
-    && websockify --web /usr/share/novnc/ 6080 localhost:5900 &\
-    && google-chrome --remote-debugging-port=9222 --no-sandbox --disable-gpu --window-size=1920,1080 --display=:99 &\
-    && sleep 3\
-    && exec python bot.py"]
+    Xvfb :99 -screen 0 1920x1080x24 & \
+    x11vnc -display :99 -forever -nopw -rfbport 5900 & \
+    websockify --web /usr/share/novnc/ 6080 localhost:5900 & \
+    google-chrome --remote-debugging-port=9222 --no-sandbox --disable-gpu --window-size=1920,1080 --display=:99 & \
+    sleep 3 && \
+    exec python bot.py"]
