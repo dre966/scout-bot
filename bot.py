@@ -499,8 +499,9 @@ class SiteBot:
             return "resume_test"
         if _text_matches(body_text, cfg.TRIGGERS["verification_ended_label"]):
             return "verification_ended"
-        if _text_matches(body_text, cfg.TRIGGERS["suspended_label"]):
-            return "suspended"
+        # suspended must be specific - "suspended" alone matches "Country temporarily suspended" in dropdown
+        # check terms before generic suspended, and require account/suspension context
+        # will be checked after terms/pages below; keep placeholder here but defer generic suspended
 
         # ---- 2. Landing / license ----
         if _text_matches(body_text, "No active license found") and _text_matches(body_text, "active Unetwork license bound"):
@@ -530,9 +531,11 @@ class SiteBot:
             return "otp_verification"
         if _text_matches(body_text, "Select Your License") or _text_matches(body_text, "Select a License"):
             return "license_select"
-        if _text_matches(body_text, "Select your country of operation") and _text_matches(body_text, "Choose a country"):
+        if _text_matches(body_text, "Select your country of operation"):
             return "country_select"
         if _text_matches(body_text, "Choose a country..."):
+            return "country_select"
+        if _text_matches(body_text, "Choose a country") and _text_matches(body_text, "Select country"):
             return "country_select"
         # role_select vs country_role_select: both have "How would you like to participate?"
         if _text_matches(body_text, "How would you like to participate?"):
@@ -553,6 +556,15 @@ class SiteBot:
         if _text_matches(body_text, "I have read and accept") and _text_matches(body_text, "Terms"):
             if _text_matches(body_text, "Terms of Service"):
                 return "terms_service"
+
+        # ---- suspended (after terms, so "Country temporarily suspended" in terms dropdown doesn't misfire) ----
+        if _text_matches(body_text, cfg.TRIGGERS["suspended_label"]):
+            # ignore if this is just the country dropdown "Country temporarily suspended" text on terms/country pages
+            is_country_dropdown = _text_matches(body_text, "Country temporarily suspended")
+            is_terms_page = _text_matches(body_text, "Terms of Service") or _text_matches(body_text, "Privacy Notice") or _text_matches(body_text, "Addendum")
+            is_country_page = _text_matches(body_text, "Select your country of operation")
+            if not (is_country_dropdown and (is_terms_page or is_country_page)):
+                return "suspended"
 
         # ---- 5. Core test-flow: test_numbers variants (before generic) ----
         # My Promoted Numbers tab: unique empty-state text "None of your tested numbers are promoted yet."
