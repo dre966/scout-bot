@@ -8,6 +8,7 @@ import random
 import json
 import os
 import requests
+from pathlib import Path
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -22,7 +23,25 @@ from selenium.common.exceptions import (
 )
 import config as cfg
 
+# OTP / Gmail helpers - lazy import to keep bot runnable without google deps installed
+try:
+    from utils.otp import get_proxy_for_bot as _get_proxy_for_bot
+    from utils.gmail import fetch_otp as _fetch_otp
+except ImportError:
+    try:
+        from utils.otp import get_proxy_for_bot as _get_proxy_for_bot
+    except ImportError:
+        _get_proxy_for_bot = None
+    try:
+        from utils.gmail import fetch_otp as _fetch_otp
+    except ImportError:
+        _fetch_otp = None
+
 PHONE_NUMBER_RE = re.compile(cfg.PHONE_NUMBER_PATTERN)
+
+# Bot identity from env - BOT_ID selects proxy_email via routing.json, BOT_EMAIL overrides
+BOT_ID = int(os.getenv("BOT_ID", "0") or "0")
+BOT_EMAIL = os.getenv("BOT_EMAIL", "").strip() or None
 
 STATES = [
     "max_sessions",
@@ -469,6 +488,104 @@ class SiteBot:
             return []
         return panel.find_elements(By.TAG_NAME, "button")
 
+    # -- auth helpers ------------------------------------------------------
+
+    def _find_element(self, by, value, timeout=3):
+        """Find single element with short wait, return None if not found."""
+        try:
+            return self.driver.find_element(by, value)
+        except NoSuchElementException:
+            return None
+
+    def _find_elements(self, by, value):
+        try:
+            return self.driver.find_elements(by, value)
+        except Exception:
+            return []
+
+    def _wait_for_element(self, by, value, timeout=5):
+        """Poll for element to appear."""
+        end = time.time() + timeout
+        while time.time() < end:
+            el = self._find_element(by, value)
+            if el is not None:
+                try:
+                    # ensure attached
+                    _ = el.is_displayed()
+                    return el
+                except StaleElementReferenceException:
+                    pass
+            time.sleep(0.3)
+        return None
+
+    def get_proxy_email_and_inbox(self):
+        """Resolve proxy_email and poll_inbox via BOT_ID / BOT_EMAIL and routing.json.
+
+        Priority:
+          1. BOT_EMAIL env override
+          2. BOT_ID % len(routing) via utils.otp.get_proxy_for_bot
+          3. Fallback to env BOT_ID local logic if utils not available
+        """
+        # Use utils.otp helper if available
+        if _get_proxy_for_bot is not None:
+            try:
+                # Re-read BOT_ID from env at call time to allow dynamic changes
+                try:
+                    bid = int(os.getenv("BOT_ID", str(BOT_ID)) or "0")
+                except ValueError:
+                    bid = BOT_ID
+                # If BOT_EMAIL override set, get_proxy_for_bot will handle it
+                proxy, inbox, entry = _get_proxy_for_bot(bot_id=bid)
+                return proxy, inbox, entry
+            except Exception as e:
+                log(f"get_proxy_for_bot failed: {e}, falling back to manual", "warn")
+
+        # Manual fallback: load routing.json directly
+        try:
+            # Check override first
+            override = os.getenv("BOT_EMAIL", "").strip() or BOT_EMAIL
+            if override:
+                # try to find inbox for override: assume faxcheck2 if not gmail direct
+                if override.lower().endswith("@gmail.com"):
+                    return override, override, {"proxy": override, "poll_inbox": override, "type": "direct"}
+                return override, "faxcheck2@gmail.com", {"proxy": override, "poll_inbox": "faxcheck2@gmail.com", "type": "forward"}
+
+            # Load routing.json manually
+            routing_paths = [
+                Path("/app/data/routing.json"),
+                Path("data/routing.json"),
+                Path(__file__).parent / "data" / "routing.json",
+            ]
+            routing = None
+            for p in routing_paths:
+                try:
+                    if p.exists():
+                        with open(p, "r", encoding="utf-8") as f:
+                            routing = json.load(f)
+                        break
+                except Exception:
+                    continue
+            if routing:
+                try:
+                    bid = int(os.getenv("BOT_ID", str(BOT_ID)) or "0")
+                except ValueError:
+                    bid = 0
+                idx = bid % len(routing)
+                entry = routing[idx]
+                return entry["proxy"], entry["poll_inbox"], entry
+        except Exception as e:
+            log(f"manual routing fallback failed: {e}", "warn")
+
+        # Ultimate fallback
+        fallback_proxy = os.getenv("BOT_EMAIL", "junchun@cultinet.site")
+        fallback_inbox = "faxcheck2@gmail.com"
+        # If proxy is gmail direct, inbox is itself
+        if fallback_proxy.lower().endswith("@gmail.com") and fallback_proxy.lower() in [
+            "vettychecky@gmail.com", "nettychecky@gmail.com", "hond2367@gmail.com", "jimmykcricket1010@gmail.com"
+        ]:
+            fallback_inbox = fallback_proxy
+        return fallback_proxy, fallback_inbox, {"proxy": fallback_proxy, "poll_inbox": fallback_inbox, "type": "fallback"}
+
     # -- state identifier --------------------------------------------------
 
     def identify_state(self) -> str:
@@ -757,8 +874,48 @@ class SiteBot:
         return True
 
     def do_landing_page(self):
-        log("STATE: landing_page", "warn")
-        return True
+        log("STATE: landing_page - clicking Login", "info")
+        # Try multiple selectors for Login button/link
+        # Primary: a[href="/auth/login"] (Next.js Link)
+        el = None
+        for selector in ['a[href="/auth/login"]', 'a[href*="/auth/login"]']:
+            el = self._find_element(By.CSS_SELECTOR, selector)
+            if el is not None:
+                break
+        if el is None:
+            # Fallback: button with text Log In / Login / Sign In
+            for txt in ["Log In", "Login", "Sign In", "Get Started"]:
+                el = self.find_button_with_text(txt)
+                if el is not None:
+                    break
+        if el is None:
+            # Last resort: any <a> containing Log In
+            try:
+                for a in self.driver.find_elements(By.TAG_NAME, "a"):
+                    try:
+                        if _text_matches(a.text, "Log In") or _text_matches(a.text, "Login"):
+                            el = a
+                            break
+                    except StaleElementReferenceException:
+                        continue
+            except Exception:
+                pass
+        if el is not None:
+            log(f"landing_page: clicking Login element <{el.tag_name}> '{el.text[:40]}'", "info")
+            if self.click(el, label="landing_login"):
+                # wait a bit for navigation to sign_in_options
+                time.sleep(1.5)
+                return True
+            try:
+                self.driver.execute_script("arguments[0].click();", el)
+                time.sleep(1.5)
+                return True
+            except Exception as e:
+                log(f"landing_page click fallback failed: {e}", "error")
+                return False
+        log("landing_page: Login button not found", "error")
+        self.log.error("landing_page: Login button not found", details={"url": getattr(self.driver, "current_url", "")})
+        return False
 
     def do_test_numbers_list(self):
         log("STATE: test_numbers_list", "ok")
@@ -805,20 +962,462 @@ class SiteBot:
         return True
 
     def do_sign_in_options(self):
-        log("STATE: sign_in_options", "info")
-        return True
+        log("STATE: sign_in_options - clicking Sign In with Email", "info")
+        # Page has "Sign In Options" + "Select how you want to access"
+        # Button is "Sign In with Email" (or Continue with Email)
+        el = None
+        for txt in ["Sign In with Email", "Continue with Email", "Sign in with Email", "Email"]:
+            el = self.find_button_with_text(txt)
+            if el is not None:
+                break
+        if el is None:
+            # Fallback: any button containing Email
+            try:
+                for btn in self.driver.find_elements(By.TAG_NAME, "button"):
+                    try:
+                        if _text_matches(btn.text, "Email"):
+                            el = btn
+                            break
+                    except StaleElementReferenceException:
+                        continue
+            except Exception:
+                pass
+        if el is not None:
+            log(f"sign_in_options: clicking '{el.text[:50]}'", "info")
+            if self.click(el, label="signin_email"):
+                time.sleep(1.5)
+                return True
+            try:
+                self.driver.execute_script("arguments[0].click();", el)
+                time.sleep(1.5)
+                return True
+            except Exception as e:
+                log(f"sign_in_options click failed: {e}", "error")
+                return False
+        log("sign_in_options: Sign In with Email button not found", "error")
+        self.log.error("sign_in_options: button not found")
+        return False
 
     def do_email_access(self):
-        log("STATE: email_access", "info")
-        return True
+        log("STATE: email_access - filling proxy email", "info")
+        proxy_email, poll_inbox, entry = self.get_proxy_email_and_inbox()
+        log(f"email_access: BOT_ID={os.getenv('BOT_ID', str(BOT_ID))} proxy={proxy_email} poll_inbox={poll_inbox} type={entry.get('type')}", "info")
+
+        # Find email input - spec says input#email
+        email_input = None
+        for by, val in [
+            (By.CSS_SELECTOR, "input#email"),
+            (By.CSS_SELECTOR, 'input[type="email"]'),
+            (By.CSS_SELECTOR, 'input[name="email"]'),
+            (By.CSS_SELECTOR, 'input[placeholder*="email" i]'),
+            (By.XPATH, '//input[@type="email"]'),
+            (By.XPATH, '//input[contains(@placeholder, "email") or contains(@placeholder, "Email")]'),
+        ]:
+            email_input = self._find_element(by, val)
+            if email_input is not None:
+                break
+        # Fallback: any input
+        if email_input is None:
+            try:
+                inputs = self.driver.find_elements(By.TAG_NAME, "input")
+                for inp in inputs:
+                    try:
+                        t = (inp.get_attribute("type") or "").lower()
+                        ph = (inp.get_attribute("placeholder") or "").lower()
+                        if t == "email" or "email" in ph:
+                            email_input = inp
+                            break
+                    except StaleElementReferenceException:
+                        continue
+                if email_input is None and inputs:
+                    # assume first input is email if only one input on page
+                    if len(inputs) == 1:
+                        email_input = inputs[0]
+            except Exception:
+                pass
+
+        if email_input is None:
+            log("email_access: email input not found", "error")
+            self.log.error("email_access: email input not found")
+            return False
+
+        log(f"email_access: typing proxy_email {proxy_email}", "info")
+        if not self.type_into(email_input, proxy_email, label="email"):
+            # fallback direct send_keys
+            try:
+                email_input.click()
+                time.sleep(0.5)
+                email_input.clear()
+                email_input.send_keys(proxy_email)
+            except Exception as e:
+                log(f"email_access: type_into failed: {e}", "error")
+                return False
+
+        time.sleep(0.8)
+
+        # Click Continue button - wait for OTP page
+        cont_btn = None
+        for txt in ["Continue", "Next", "Send code", "Get code"]:
+            cont_btn = self.find_button_with_text(txt)
+            if cont_btn is not None:
+                break
+        if cont_btn is None:
+            # Fallback: type submit or button with type submit
+            for by, val in [
+                (By.CSS_SELECTOR, 'button[type="submit"]'),
+                (By.XPATH, '//button[contains(translate(text(),"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "continue")]'),
+            ]:
+                cont_btn = self._find_element(by, val)
+                if cont_btn is not None:
+                    break
+
+        if cont_btn is None:
+            log("email_access: Continue button not found after filling email", "error")
+            # try press Enter in email input
+            try:
+                from selenium.webdriver.common.keys import Keys
+                email_input.send_keys(Keys.ENTER)
+                time.sleep(1.5)
+                return True
+            except Exception:
+                return False
+
+        # Ensure button is enabled; wait if disabled briefly
+        try:
+            is_disabled = cont_btn.get_attribute("disabled") is not None or cont_btn.get_attribute("aria-disabled") == "true"
+            if is_disabled:
+                log("email_access: Continue button disabled, waiting...", "warn")
+                time.sleep(1.5)
+        except Exception:
+            pass
+
+        log(f"email_access: clicking Continue '{cont_btn.text[:30]}'", "info")
+        if self.click(cont_btn, label="email_continue"):
+            time.sleep(1.5)
+            return True
+        try:
+            self.driver.execute_script("arguments[0].click();", cont_btn)
+            time.sleep(1.5)
+            return True
+        except Exception as e:
+            log(f"email_access: click Continue failed: {e}", "error")
+            return False
 
     def do_otp_verification(self):
-        log("STATE: otp_verification", "info")
-        return True
+        log("STATE: otp_verification - fetching OTP via Gmail API", "info")
+        proxy_email, poll_inbox, entry = self.get_proxy_email_and_inbox()
+        log(f"otp_verification: proxy={proxy_email} poll_inbox={poll_inbox} timeout=60s", "info")
+
+        # Fetch OTP via Gmail API
+        otp_code = None
+        # Prefer utils.gmail fetch_otp if available
+        fetch_fn = _fetch_otp
+        if fetch_fn is None:
+            try:
+                from utils.gmail import fetch_otp as _fn
+                fetch_fn = _fn
+            except ImportError:
+                try:
+                    from utils.otp import fetch_otp_for_bot as _fn2
+                    # will be handled below
+                    fetch_fn = None
+                except ImportError:
+                    fetch_fn = None
+
+        if fetch_fn is not None:
+            try:
+                otp_code = fetch_fn(proxy_email, poll_inbox, timeout=60, poll_interval=3)
+            except Exception as e:
+                log(f"otp_verification: fetch_otp exception: {e}", "error")
+                self.log.error("otp_verification fetch failed", details={"error": str(e), "proxy": proxy_email, "poll_inbox": poll_inbox})
+        else:
+            # Fallback via utils.otp wrapper
+            try:
+                from utils.otp import fetch_otp_for_bot
+                # Use BOT_ID from env
+                try:
+                    bid = int(os.getenv("BOT_ID", str(BOT_ID)) or "0")
+                except ValueError:
+                    bid = 0
+                otp_code = fetch_otp_for_bot(bot_id=bid, timeout=60, poll_interval=3)
+            except Exception as e:
+                log(f"otp_verification: fallback fetch_otp_for_bot failed: {e}", "error")
+                self.log.error("otp_verification fallback failed", details={"error": str(e)})
+
+        if not otp_code:
+            log(f"otp_verification: no OTP found for {proxy_email} in 60s", "error")
+            self.log.error("otp_verification: no OTP found in 60s", details={"proxy": proxy_email, "poll_inbox": poll_inbox})
+            return False
+
+        log(f"otp_verification: got OTP {otp_code[:2]}**{otp_code[-1]} for {proxy_email}", "ok")
+        # Fill 6 inputs - spec says input[maxlength=1] and h-14 w-12 selector
+        inputs = []
+        for selector in [
+            "input[maxlength='1']",
+            "input[maxlength=\"1\"]",
+            "input.h-14.w-12",
+            "input[class*='h-14'][class*='w-12']",
+            "input[inputmode='numeric']",
+        ]:
+            try:
+                found = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if len(found) >= 6:
+                    inputs = found[:6]
+                    log(f"otp_verification: found {len(found)} inputs via '{selector}'", "info")
+                    break
+                elif len(found) > 0 and len(found) < 6:
+                    # keep but continue searching for 6
+                    if len(found) > len(inputs):
+                        inputs = found
+            except Exception:
+                continue
+
+        if len(inputs) < 6:
+            # Fallback: any 6 single-char inputs or all inputs with maxlength 1
+            try:
+                all_inputs = self.driver.find_elements(By.TAG_NAME, "input")
+                single = [i for i in all_inputs if (i.get_attribute("maxlength") == "1" or i.get_attribute("maxLength") == "1")]
+                if len(single) >= 6:
+                    inputs = single[:6]
+                    log(f"otp_verification: fallback found {len(single)} maxlength=1 inputs", "info")
+                elif len(all_inputs) >= 6:
+                    # last fallback: use last 6 inputs? but OTP inputs are likely 6
+                    # filter by numeric inputmode
+                    numeric = [i for i in all_inputs if (i.get_attribute("inputmode") or "").lower() == "numeric"]
+                    if len(numeric) >= 6:
+                        inputs = numeric[:6]
+                        log("otp_verification: fallback numeric inputs", "info")
+            except Exception as e:
+                log(f"otp_verification: fallback input search failed: {e}", "warn")
+
+        if len(inputs) < 6:
+            log(f"otp_verification: found only {len(inputs)} OTP inputs, expected 6", "error")
+            self.log.error("otp_verification: OTP inputs not found", details={"found": len(inputs)})
+            return False
+
+        # Type each digit
+        for idx, digit in enumerate(otp_code.strip()):
+            if idx >= len(inputs):
+                break
+            el = inputs[idx]
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                time.sleep(0.15)
+                el.click()
+                time.sleep(0.15)
+                el.clear()
+                el.send_keys(digit)
+                log(f"otp_verification: filled input {idx+1} with {digit}", "info")
+                time.sleep(0.2)
+            except Exception as e:
+                log(f"otp_verification: failed to fill input {idx+1}: {e}", "error")
+                # try js fallback
+                try:
+                    self.driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles:true}));", el, digit)
+                except Exception:
+                    pass
+
+        time.sleep(0.8)
+
+        # Click Continue - handle disabled button
+        cont_btn = None
+        for txt in ["Continue", "Verify", "Submit"]:
+            cont_btn = self.find_button_with_text(txt)
+            if cont_btn is not None:
+                break
+        if cont_btn is None:
+            cont_btn = self._find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+
+        if cont_btn is None:
+            log("otp_verification: Continue button not found after filling OTP", "error")
+            self.log.error("otp_verification: Continue not found")
+            return False
+
+        # Handle disabled button - wait for it to become enabled
+        for _ in range(5):
+            try:
+                disabled_attr = cont_btn.get_attribute("disabled")
+                aria_disabled = cont_btn.get_attribute("aria-disabled")
+                cls = cont_btn.get_attribute("class") or ""
+                is_disabled = disabled_attr is not None or aria_disabled == "true" or "opacity" in cls and "cursor-not-allowed" in cls
+                if is_disabled:
+                    log("otp_verification: Continue disabled, waiting 0.5s...", "warn")
+                    time.sleep(0.5)
+                    continue
+                break
+            except StaleElementReferenceException:
+                # re-find button
+                cont_btn = self.find_button_with_text("Continue") or self._find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+                if cont_btn is None:
+                    break
+                time.sleep(0.3)
+                continue
+
+        log(f"otp_verification: clicking Continue '{cont_btn.text[:30] if cont_btn else ''}'", "info")
+        if self.click(cont_btn, label="otp_continue"):
+            time.sleep(1.5)
+            return True
+        try:
+            self.driver.execute_script("arguments[0].click();", cont_btn)
+            time.sleep(1.5)
+            return True
+        except Exception as e:
+            log(f"otp_verification: click Continue failed: {e}", "error")
+            return False
 
     def do_license_select(self):
-        log("STATE: license_select", "info")
-        return True
+        log("STATE: license_select - selecting license", "info")
+        license_id = os.getenv("LICENSE_ID", "").strip()
+        if license_id:
+            log(f"license_select: LICENSE_ID env={license_id}, trying to select specific license", "info")
+        else:
+            log("license_select: no LICENSE_ID env, will select first enabled license", "info")
+
+        # License cards are buttons with border-cta-teal etc. Look for license list.
+        # Strategy: find all buttons that look like license cards, then pick first enabled or matching LICENSE_ID.
+
+        # Try to find license card buttons - they are often divs/buttons with border classes
+        candidates = []
+        # Common selectors for license cards
+        for selector in [
+            "button[class*='border-cta-teal']",
+            "button[class*='border-teal']",
+            "div[class*='border-cta-teal']",
+            "button[class*='rounded']",
+        ]:
+            try:
+                els = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                for el in els:
+                    try:
+                        txt = (el.text or "").strip()
+                        if txt and ("License" in el.text or "license" in txt.lower() or len(txt) > 5):
+                            candidates.append(el)
+                    except StaleElementReferenceException:
+                        continue
+                if candidates:
+                    break
+            except Exception:
+                continue
+
+        # Fallback: find all buttons and filter by likely license card text length
+        if not candidates:
+            try:
+                for btn in self.driver.find_elements(By.TAG_NAME, "button"):
+                    try:
+                        txt = (btn.text or "").strip()
+                        cls = btn.get_attribute("class") or ""
+                        # License cards often have large text blocks vs small Continue buttons
+                        if txt and len(txt) > 10 and "Continue" not in txt and "Select" not in txt:
+                            # exclude known non-license buttons
+                            if txt.lower().startswith("continue") or txt.lower().startswith("cancel"):
+                                continue
+                            candidates.append(btn)
+                    except StaleElementReferenceException:
+                        continue
+            except Exception:
+                pass
+
+        # If still no candidates, try divs that are clickable
+        if not candidates:
+            try:
+                for div in self.driver.find_elements(By.CSS_SELECTOR, "div[role='button'], div.cursor-pointer"):
+                    try:
+                        txt = (div.text or "").strip()
+                        if txt and len(txt) > 10:
+                            candidates.append(div)
+                    except StaleElementReferenceException:
+                        continue
+            except Exception:
+                pass
+
+        log(f"license_select: found {len(candidates)} candidate license cards", "info")
+
+        target_card = None
+        if license_id:
+            # Try to match license_id substring in card text or data attributes
+            for card in candidates:
+                try:
+                    txt = (card.text or "").lower()
+                    if license_id.lower() in txt:
+                        target_card = card
+                        log(f"license_select: matched LICENSE_ID '{license_id}' in card text", "info")
+                        break
+                    # check attributes
+                    lid = card.get_attribute("data-license-id") or card.get_attribute("id") or ""
+                    if license_id.lower() in lid.lower():
+                        target_card = card
+                        break
+                except StaleElementReferenceException:
+                    continue
+
+        if target_card is None and candidates:
+            # Pick first enabled (not disabled, not opacity-50)
+            for card in candidates:
+                try:
+                    cls = card.get_attribute("class") or ""
+                    disabled = card.get_attribute("disabled") is not None or card.get_attribute("aria-disabled") == "true"
+                    if disabled or "opacity-50" in cls or "cursor-not-allowed" in cls:
+                        continue
+                    target_card = card
+                    break
+                except StaleElementReferenceException:
+                    continue
+            if target_card is None:
+                target_card = candidates[0]
+
+        if target_card is not None:
+            try:
+                txt_preview = (target_card.text or "")[:60].replace("\n", " ")
+                log(f"license_select: clicking license card '{txt_preview}...'", "info")
+            except Exception:
+                pass
+            if not self.click(target_card, label="license_card"):
+                try:
+                    self.driver.execute_script("arguments[0].click();", target_card)
+                except Exception as e:
+                    log(f"license_select: card click failed: {e}", "error")
+
+            time.sleep(0.8)
+
+        # Now click Continue button
+        cont_btn = None
+        for txt in ["Continue", "Next", "Select"]:
+            cont_btn = self.find_button_with_text(txt)
+            if cont_btn is not None:
+                break
+        if cont_btn is None:
+            cont_btn = self._find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+
+        if cont_btn is None:
+            log("license_select: Continue button not found", "error")
+            self.log.error("license_select: Continue not found")
+            return False
+
+        # Wait if disabled
+        for _ in range(5):
+            try:
+                disabled = cont_btn.get_attribute("disabled") is not None or cont_btn.get_attribute("aria-disabled") == "true"
+                if disabled:
+                    log("license_select: Continue disabled, waiting...", "warn")
+                    time.sleep(0.5)
+                    continue
+                break
+            except StaleElementReferenceException:
+                cont_btn = self.find_button_with_text("Continue")
+                time.sleep(0.3)
+                continue
+
+        log(f"license_select: clicking Continue '{cont_btn.text[:30] if cont_btn else ''}'", "info")
+        if self.click(cont_btn, label="license_continue"):
+            time.sleep(1.5)
+            return True
+        try:
+            self.driver.execute_script("arguments[0].click();", cont_btn)
+            time.sleep(1.5)
+            return True
+        except Exception as e:
+            log(f"license_select: Continue click failed: {e}", "error")
+            return False
 
     def do_country_select(self):
         log("STATE: country_select", "info")

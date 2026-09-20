@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 .env
-data/
+data/*
 logs/
 tested_numbers.json
 honeypot_data.json
@@ -9,3 +9,6 @@ config.json
 proxies.txt
 *.json
 !package.json
+!data/routing.json
+!data/gmail_credentials.json
+!data/gmail_token.json
