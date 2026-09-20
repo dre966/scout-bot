@@ -32,6 +32,7 @@ STATES = [
     "verification_ended",
     "suspended",
     "landing_page",
+    "no_active_license",
     "test_numbers_list",
     "nothing_to_scout",
     "confirm_session",
@@ -261,6 +262,7 @@ class SiteBot:
             "runner_sims_page": self.do_runner_sims_page,
             "runner_add_sim_packages": self.do_runner_add_sim_packages,
             "runner_register_sim_form": self.do_runner_register_sim_form,
+            "no_active_license": self.do_no_active_license,
             "settings_page": self.do_settings_page,
             "delete_account_modal": self.do_delete_account_modal,
             "switch_role_modal": self.do_switch_role_modal,
@@ -500,7 +502,9 @@ class SiteBot:
         if _text_matches(body_text, cfg.TRIGGERS["suspended_label"]):
             return "suspended"
 
-        # ---- 2. Landing ----
+        # ---- 2. Landing / license ----
+        if _text_matches(body_text, "No active license found") and _text_matches(body_text, "active Unetwork license bound"):
+            return "no_active_license"
         if _text_matches(body_text, cfg.TRIGGERS["landing_page_label"]):
             return "landing_page"
 
@@ -803,6 +807,10 @@ class SiteBot:
 
     def do_country_role_select(self):
         log("STATE: country_role_select", "info")
+        return True
+
+    def do_no_active_license(self):
+        log("STATE: no_active_license", "warn")
         return True
 
     def do_verify_identity(self):
