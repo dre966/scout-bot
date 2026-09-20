@@ -43,6 +43,44 @@ STATES = [
     "call_this_number",
     "continue_verification",
     "call_result",
+    # --- extended states (auth / onboarding) ---
+    "sign_in_options",
+    "email_access",
+    "otp_verification",
+    "license_select",
+    "country_select",
+    "role_select",
+    "country_role_select",
+    "verify_identity",
+    "terms_service",
+    "terms_scout_addendum",
+    "terms_runner_addendum",
+    "terms_privacy",
+    # --- extended states (scout app pages) ---
+    "scout_dashboard",
+    "test_numbers_available",
+    "test_numbers_my_verified",
+    "test_numbers_my_promoted",
+    "test_numbers_sim_dropdown",
+    "sims_page",
+    "add_sim_select_plan",
+    "scoutquest_my_submissions",
+    "scoutquest_results",
+    "messages_inbox",
+    "messages_resolved",
+    # --- extended states (runner app pages) ---
+    "runner_dashboard",
+    "runner_register_sim",
+    "runner_available_numbers",
+    "runner_call_history",
+    "runner_top_up",
+    "runner_sims_page",
+    "runner_add_sim_packages",
+    "runner_register_sim_form",
+    # --- extended states (settings / modals) ---
+    "settings_page",
+    "delete_account_modal",
+    "switch_role_modal",
     "unknown",
 ]
 
@@ -191,6 +229,41 @@ class SiteBot:
             "call_this_number": self.do_call_this_number,
             "continue_verification": self.do_continue_verification,
             "call_result": self.do_call_result,
+            # extended
+            "sign_in_options": self.do_sign_in_options,
+            "email_access": self.do_email_access,
+            "otp_verification": self.do_otp_verification,
+            "license_select": self.do_license_select,
+            "country_select": self.do_country_select,
+            "role_select": self.do_role_select,
+            "country_role_select": self.do_country_role_select,
+            "verify_identity": self.do_verify_identity,
+            "terms_service": self.do_terms_service,
+            "terms_scout_addendum": self.do_terms_scout_addendum,
+            "terms_runner_addendum": self.do_terms_runner_addendum,
+            "terms_privacy": self.do_terms_privacy,
+            "scout_dashboard": self.do_scout_dashboard,
+            "test_numbers_available": self.do_test_numbers_available,
+            "test_numbers_my_verified": self.do_test_numbers_my_verified,
+            "test_numbers_my_promoted": self.do_test_numbers_my_promoted,
+            "test_numbers_sim_dropdown": self.do_test_numbers_sim_dropdown,
+            "sims_page": self.do_sims_page,
+            "add_sim_select_plan": self.do_add_sim_select_plan,
+            "scoutquest_my_submissions": self.do_scoutquest_my_submissions,
+            "scoutquest_results": self.do_scoutquest_results,
+            "messages_inbox": self.do_messages_inbox,
+            "messages_resolved": self.do_messages_resolved,
+            "runner_dashboard": self.do_runner_dashboard,
+            "runner_register_sim": self.do_runner_register_sim,
+            "runner_available_numbers": self.do_runner_available_numbers,
+            "runner_call_history": self.do_runner_call_history,
+            "runner_top_up": self.do_runner_top_up,
+            "runner_sims_page": self.do_runner_sims_page,
+            "runner_add_sim_packages": self.do_runner_add_sim_packages,
+            "runner_register_sim_form": self.do_runner_register_sim_form,
+            "settings_page": self.do_settings_page,
+            "delete_account_modal": self.do_delete_account_modal,
+            "switch_role_modal": self.do_switch_role_modal,
             "unknown": self.do_unknown,
         }
 
@@ -379,48 +452,136 @@ class SiteBot:
 
     def identify_state(self) -> str:
         """Pure detection: returns a state string based SOLELY on page text /
-        DOM detection (no side effects). Respects priority order from
-        smart_call_yours.py tick()."""
+        DOM detection (no side effects).
+
+        Priority order (documented):
+        1. Core test-flow critical states (max_sessions -> suspended) - must win over everything.
+        2. Landing + auth/onboarding (landing_page, sign_in_options, email_access,
+           otp_verification, license_select, country_select, role_select/country_role_select,
+           verify_identity, terms_*) - checked early so login flow never hits unknown.
+        3. Modal / overlay states (delete_account_modal, switch_role_modal) - checked early
+           because they overlay other pages; text appears on top of body.
+        4. Core test-flow main loop (test_numbers variants, nothing_to_scout,
+           confirm_session -> call_result) - original 19 STATES priority preserved.
+        5. Extended app pages (scout_dashboard, sims_page, scoutquest, messages,
+           runner pages, settings) - AFTER test-flow so active testing is prioritized.
+        6. unknown fallback.
+        """
         body_text = self.get_body_text()
 
-        # 1. max_sessions (page-wide first, every tick)
+        # ---- 1. Core critical (page-wide first, every tick) ----
         if _text_matches(body_text, cfg.TRIGGERS["max_sessions_label"]):
             return "max_sessions"
-
-        # 2. keep_testing_dialog (check button exists, regardless of call_count)
         if self.find_button_with_text(cfg.TRIGGERS["keep_testing_button"]) is not None:
             return "keep_testing_dialog"
-
-        # 3. already_tested
         if _text_matches(body_text, cfg.TRIGGERS["already_tested_label"]):
             return "already_tested"
-
-        # 4. resume_test
         if _text_matches(body_text, cfg.TRIGGERS["resume_test_label"]):
             return "resume_test"
-
-        # 5. verification_ended
         if _text_matches(body_text, cfg.TRIGGERS["verification_ended_label"]):
             return "verification_ended"
-
-        # 6. suspended
         if _text_matches(body_text, cfg.TRIGGERS["suspended_label"]):
             return "suspended"
 
-        # 7. landing_page
+        # ---- 2. Landing ----
         if _text_matches(body_text, cfg.TRIGGERS["landing_page_label"]):
             return "landing_page"
 
-        # 8. test_numbers_list (via find_test_number_rows)
+        # ---- 3. Modal / overlay (must beat page content) ----
+        if _text_matches(body_text, "Delete Account?") and _text_matches(body_text, "Type DELETE to confirm"):
+            return "delete_account_modal"
+        # switch_role_modal: appears when clicking user name box
+        if _text_matches(body_text, "Switch to Runner") or _text_matches(body_text, "Switch to Scout"):
+            return "switch_role_modal"
+        if _text_matches(body_text, "Sign Out") and _text_matches(body_text, "Switch to"):
+            return "switch_role_modal"
+
+        # ---- 4. Auth / onboarding (before generic test_numbers) ----
+        if _text_matches(body_text, "Sign In Options") and _text_matches(body_text, "Select how you want to access"):
+            return "sign_in_options"
+        if _text_matches(body_text, "Access Scout & Runner") and _text_matches(body_text, "Unetwork account email"):
+            return "email_access"
+        if _text_matches(body_text, "Enter your Unetwork account email"):
+            return "email_access"
+        if _text_matches(body_text, "Verification Code") and _text_matches(body_text, "6-digit code"):
+            return "otp_verification"
+        if _text_matches(body_text, "We\'ve sent a 6-digit code"):
+            return "otp_verification"
+        if _text_matches(body_text, "Select Your License") or _text_matches(body_text, "Select a License"):
+            return "license_select"
+        if _text_matches(body_text, "Select your country of operation") and _text_matches(body_text, "Choose a country"):
+            return "country_select"
+        if _text_matches(body_text, "Choose a country..."):
+            return "country_select"
+        # role_select vs country_role_select: both have "How would you like to participate?"
+        if _text_matches(body_text, "How would you like to participate?"):
+            if _text_matches(body_text, "Choose a country") or _text_matches(body_text, "Select your country"):
+                return "country_role_select"
+            return "role_select"
+        if _text_matches(body_text, "Your Scout seat is reserved") and _text_matches(body_text, "Verify my identity"):
+            return "verify_identity"
+        # Terms pages - most specific first
+        if _text_matches(body_text, "Scout Terms \u2014 Addendum A"):
+            return "terms_scout_addendum"
+        if _text_matches(body_text, "Runner Terms \u2014 Addendum B"):
+            return "terms_runner_addendum"
+        if _text_matches(body_text, "Scout & Runner Privacy Notice"):
+            return "terms_privacy"
+        if _text_matches(body_text, "Scout & Runner Terms of Service"):
+            return "terms_service"
+        if _text_matches(body_text, "I have read and accept") and _text_matches(body_text, "Terms"):
+            if _text_matches(body_text, "Terms of Service"):
+                return "terms_service"
+
+        # ---- 5. Core test-flow: test_numbers variants (before generic) ----
+        # My Promoted Numbers tab: unique empty-state text "None of your tested numbers are promoted yet."
+        # Do NOT trigger on just the tab label since all Test Numbers pages contain all three tab labels.
+        if _text_matches(body_text, "None of your tested numbers are promoted yet"):
+            # if dropdown expanded, it also contains this empty text plus duplicate SIM entries -> prioritize dropdown
+            # dropdown check is below, so we let dropdown win when toggle expanded
+            # For now return promoted; dropdown will be checked before available but after this, so need to check dropdown first
+            # To allow dropdown to win, we defer promoted when dropdown would match; we check dropdown before final return
+            # Check dropdown early: if toggle expanded, treat as dropdown
+            try:
+                _toggle = self.find_filter_toggle_button()
+                if _toggle is not None and len(self.get_filter_dropdown_options(_toggle)) > 1:
+                    return "test_numbers_sim_dropdown"
+            except Exception:
+                pass
+            return "test_numbers_my_promoted"
+        # My Verified Numbers: unique content "0 of 5 verified" appears only on verified tab (not on promoted/available)
+        if _text_matches(body_text, "My Verified Numbers") and _text_matches(body_text, "0 of 5 verified"):
+            return "test_numbers_my_verified"
+        # fallback: if body contains My Verified label but not promoted empty and not available, still treat as verified
+        # but avoid misclassifying available/promoted which also have label; require absence of promoted empty
+        if _text_matches(body_text, "My Verified Numbers") and not _text_matches(body_text, "None of your tested numbers are promoted yet"):
+            # if page has Test Numbers and My Verified but no verified content, it could still be verified empty state
+            # For now, only return verified if we see verified-specific marker; otherwise fall through to available
+            pass
+        # SIM dropdown expanded: Available Numbers + dropdown options >1
+        if _text_matches(body_text, "Available Numbers") and _text_matches(body_text, "Test Numbers"):
+            try:
+                toggle = self.find_filter_toggle_button()
+                if toggle is not None:
+                    opts = self.get_filter_dropdown_options(toggle)
+                    if len(opts) > 1:
+                        return "test_numbers_sim_dropdown"
+                    if _text_matches(body_text, "Unlimited Starter") or _text_matches(body_text, "US Mobile"):
+                        if _text_matches(body_text, "Unlimited Starter + International calling"):
+                            return "test_numbers_sim_dropdown"
+            except Exception:
+                pass
+        # test_numbers_available: main Available Numbers tab active
+        if _text_matches(body_text, "Available Numbers") and _text_matches(body_text, "Test Numbers"):
+            return "test_numbers_available"
+
+        # generic test_numbers_list (via find_test_number_rows)
         rows = self.find_test_number_rows()
         if rows:
             return "test_numbers_list"
 
-        # 9. nothing_to_scout
         if _text_matches(body_text, cfg.TRIGGERS["nothing_to_scout_label"]):
             return "nothing_to_scout"
-
-        # 10. confirm_session / balance_entry / package_select / select_one / call_completed / verification_complete / call_this_number / continue_verification / call_result
         if _text_matches(body_text, cfg.TRIGGERS["confirm_session_label"]):
             return "confirm_session"
         if _text_matches(body_text, cfg.TRIGGERS["balance_entry_label"]):
@@ -440,7 +601,64 @@ class SiteBot:
         if _text_matches(body_text, cfg.TRIGGERS["call_result_label"]):
             return "call_result"
 
-        # 11. unknown (fallback) - debug preview
+        # ---- 6. Extended app pages (scout) ----
+        if _text_matches(body_text, "Scout Dashboard") and _text_matches(body_text, "Start Validating Numbers"):
+            return "scout_dashboard"
+        if _text_matches(body_text, "Scout Dashboard"):
+            return "scout_dashboard"
+        if _text_matches(body_text, "SIM Management") and _text_matches(body_text, "Total SIMs"):
+            return "sims_page"
+        if _text_matches(body_text, "Select an approved call plan"):
+            return "add_sim_select_plan"
+        if _text_matches(body_text, "ScoutQuest Results"):
+            return "scoutquest_results"
+        if _text_matches(body_text, "ScoutQuest") and _text_matches(body_text, "My Submissions"):
+            return "scoutquest_my_submissions"
+        # messages - use unique empty-state strings since both tabs labels appear on both pages
+        # Inbox tab: "No messages yet" ; Resolved tab: "No resolved tickets"
+        if _text_matches(body_text, "No resolved tickets"):
+            return "messages_resolved"
+        if _text_matches(body_text, "No messages yet"):
+            return "messages_inbox"
+        # fallback generic tab check (when messages list not empty)
+        if _text_matches(body_text, "Messages") and _text_matches(body_text, "Resolved"):
+            return "messages_resolved"
+        if _text_matches(body_text, "Messages") and _text_matches(body_text, "Inbox"):
+            return "messages_inbox"
+
+        # ---- 7. Extended app pages (runner) ----
+        if _text_matches(body_text, "Runner Dashboard"):
+            return "runner_dashboard"
+        if _text_matches(body_text, "Register SIM") and _text_matches(body_text, "Phone Number") and _text_matches(body_text, "Country"):
+            if _text_matches(body_text, "Available Packages"):
+                return "runner_add_sim_packages"
+            return "runner_register_sim_form"
+        if _text_matches(body_text, "Register SIM"):
+            return "runner_register_sim"
+        if _text_matches(body_text, "Available Numbers") and _text_matches(body_text, "Reward Rate"):
+            return "runner_available_numbers"
+        if _text_matches(body_text, "Available Numbers") and _text_matches(body_text, "Get package"):
+            return "runner_available_numbers"
+        if _text_matches(body_text, "Call History") and _text_matches(body_text, "Total Rewards"):
+            return "runner_call_history"
+        if _text_matches(body_text, "Top Up with UP") or _text_matches(body_text, "Instant credit delivery"):
+            return "runner_top_up"
+        if _text_matches(body_text, "My SIMs") and _text_matches(body_text, "Use your UP balance to add credit"):
+            return "runner_sims_page"
+        if _text_matches(body_text, "Available Packages"):
+            return "runner_add_sim_packages"
+        if _text_matches(body_text, "My SIMs"):
+            return "runner_sims_page"
+
+        # ---- 8. Settings ----
+        if _text_matches(body_text, "Runner Settings") or _text_matches(body_text, "Manage your runner profile"):
+            return "settings_page"
+        if _text_matches(body_text, "Scout Settings") or _text_matches(body_text, "Manage your scout profile"):
+            return "settings_page"
+        if _text_matches(body_text, "Settings") and _text_matches(body_text, "Delete Account"):
+            return "settings_page"
+
+        # ---- 9. unknown (fallback) ----
         preview = body_text[:120].replace("\n", " ") if body_text else ""
         log(f"unknown state - page preview: '{preview}...'", "warn")
         return "unknown"
@@ -517,6 +735,142 @@ class SiteBot:
 
     def do_call_result(self):
         log("STATE: call_result")
+        return True
+
+    def do_sign_in_options(self):
+        log("STATE: sign_in_options", "info")
+        return True
+
+    def do_email_access(self):
+        log("STATE: email_access", "info")
+        return True
+
+    def do_otp_verification(self):
+        log("STATE: otp_verification", "info")
+        return True
+
+    def do_license_select(self):
+        log("STATE: license_select", "info")
+        return True
+
+    def do_country_select(self):
+        log("STATE: country_select", "info")
+        return True
+
+    def do_role_select(self):
+        log("STATE: role_select", "info")
+        return True
+
+    def do_country_role_select(self):
+        log("STATE: country_role_select", "info")
+        return True
+
+    def do_verify_identity(self):
+        log("STATE: verify_identity", "info")
+        return True
+
+    def do_terms_service(self):
+        log("STATE: terms_service", "info")
+        return True
+
+    def do_terms_scout_addendum(self):
+        log("STATE: terms_scout_addendum", "info")
+        return True
+
+    def do_terms_runner_addendum(self):
+        log("STATE: terms_runner_addendum", "info")
+        return True
+
+    def do_terms_privacy(self):
+        log("STATE: terms_privacy", "info")
+        return True
+
+    def do_scout_dashboard(self):
+        log("STATE: scout_dashboard", "info")
+        return True
+
+    def do_test_numbers_available(self):
+        log("STATE: test_numbers_available", "info")
+        return True
+
+    def do_test_numbers_my_verified(self):
+        log("STATE: test_numbers_my_verified", "info")
+        return True
+
+    def do_test_numbers_my_promoted(self):
+        log("STATE: test_numbers_my_promoted", "info")
+        return True
+
+    def do_test_numbers_sim_dropdown(self):
+        log("STATE: test_numbers_sim_dropdown", "info")
+        return True
+
+    def do_sims_page(self):
+        log("STATE: sims_page", "info")
+        return True
+
+    def do_add_sim_select_plan(self):
+        log("STATE: add_sim_select_plan", "info")
+        return True
+
+    def do_scoutquest_my_submissions(self):
+        log("STATE: scoutquest_my_submissions", "info")
+        return True
+
+    def do_scoutquest_results(self):
+        log("STATE: scoutquest_results", "info")
+        return True
+
+    def do_messages_inbox(self):
+        log("STATE: messages_inbox", "info")
+        return True
+
+    def do_messages_resolved(self):
+        log("STATE: messages_resolved", "info")
+        return True
+
+    def do_runner_dashboard(self):
+        log("STATE: runner_dashboard", "info")
+        return True
+
+    def do_runner_register_sim(self):
+        log("STATE: runner_register_sim", "info")
+        return True
+
+    def do_runner_available_numbers(self):
+        log("STATE: runner_available_numbers", "info")
+        return True
+
+    def do_runner_call_history(self):
+        log("STATE: runner_call_history", "info")
+        return True
+
+    def do_runner_top_up(self):
+        log("STATE: runner_top_up", "info")
+        return True
+
+    def do_runner_sims_page(self):
+        log("STATE: runner_sims_page", "info")
+        return True
+
+    def do_runner_add_sim_packages(self):
+        log("STATE: runner_add_sim_packages", "info")
+        return True
+
+    def do_runner_register_sim_form(self):
+        log("STATE: runner_register_sim_form", "info")
+        return True
+
+    def do_settings_page(self):
+        log("STATE: settings_page", "info")
+        return True
+
+    def do_delete_account_modal(self):
+        log("STATE: delete_account_modal", "warn")
+        return True
+
+    def do_switch_role_modal(self):
+        log("STATE: switch_role_modal", "warn")
         return True
 
     def do_unknown(self):
