@@ -50,6 +50,8 @@ ENTRYPOINT ["/bin/bash", "-c", "\
     x11vnc -display :99 -forever -nopw -rfbport 5900 & \
     websockify --web /usr/share/novnc/ 6080 localhost:5900 & \
     sleep 2 && \
-    google-chrome --remote-debugging-port=9222 --no-sandbox --disable-dev-shm-usage --disable-gpu --window-size=1920,1080 --remote-allow-origins=* & \
-    sleep 4 && \
+    google-chrome --remote-debugging-port=9222 --no-sandbox --disable-dev-shm-usage --disable-gpu --window-size=1920,1080 --remote-allow-origins=* > /tmp/chrome.log 2>&1 & \
+    echo \"[entrypoint] waiting for chrome on 9222...\" && \
+    for i in 1 2 3 4 5 6 7 8 9 10; do curl -sf http://127.0.0.1:9222/json/version && echo \"[entrypoint] chrome ready\" && break || { echo \"[entrypoint] chrome not ready $i/10\"; sleep 1; }; done; \
+    cat /tmp/chrome.log; \
     exec python bot.py"]
