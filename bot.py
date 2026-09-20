@@ -667,16 +667,24 @@ class SiteBot:
         # ---- 7. Extended app pages (runner) ----
         if _text_matches(body_text, "Runner Dashboard"):
             return "runner_dashboard"
-        if _text_matches(body_text, "Register SIM") and _text_matches(body_text, "Phone Number") and _text_matches(body_text, "Country"):
-            if _text_matches(body_text, "Available Packages"):
-                return "runner_add_sim_packages"
-            return "runner_register_sim_form"
-        if _text_matches(body_text, "Register SIM"):
-            return "runner_register_sim"
+        # Runner Available Numbers page has "Reward Rate" + "Register SIM to Test" buttons -> must be checked BEFORE generic Register SIM
         if _text_matches(body_text, "Available Numbers") and _text_matches(body_text, "Reward Rate"):
             return "runner_available_numbers"
         if _text_matches(body_text, "Available Numbers") and _text_matches(body_text, "Get package"):
             return "runner_available_numbers"
+        # Runner register form has input fields with labels Country/Phone Number/Carrier - not just the card button text "Register SIM to Test"
+        if _text_matches(body_text, "Register SIM") and _text_matches(body_text, "Phone Number") and _text_matches(body_text, "Country"):
+            if _text_matches(body_text, "Available Packages"):
+                return "runner_add_sim_packages"
+            # require Carrier field to distinguish form from card button
+            if _text_matches(body_text, "Carrier"):
+                return "runner_register_sim_form"
+            return "runner_register_sim_form"
+        if _text_matches(body_text, "Register SIM") and _text_matches(body_text, "Available Packages"):
+            return "runner_add_sim_packages"
+        # generic Register SIM page (scout Add SIM / runner Add SIM flow) - only if it has Step indicator or Browse/SIM/Verify/Package stepper
+        if _text_matches(body_text, "Register SIM") and (_text_matches(body_text, "Browse") or _text_matches(body_text, "Step 2 of 4")):
+            return "runner_register_sim"
         if _text_matches(body_text, "Call History") and _text_matches(body_text, "Total Rewards"):
             return "runner_call_history"
         if _text_matches(body_text, "Top Up with UP") or _text_matches(body_text, "Instant credit delivery"):
