@@ -53,6 +53,7 @@ STATES = [
     "role_select",
     "country_role_select",
     "verify_identity",
+    "identity_verified",
     "terms_service",
     "terms_scout_addendum",
     "terms_runner_addendum",
@@ -239,6 +240,7 @@ class SiteBot:
             "role_select": self.do_role_select,
             "country_role_select": self.do_country_role_select,
             "verify_identity": self.do_verify_identity,
+            "identity_verified": self.do_identity_verified,
             "terms_service": self.do_terms_service,
             "terms_scout_addendum": self.do_terms_scout_addendum,
             "terms_runner_addendum": self.do_terms_runner_addendum,
@@ -542,8 +544,14 @@ class SiteBot:
             if _text_matches(body_text, "Choose a country") or _text_matches(body_text, "Select your country"):
                 return "country_role_select"
             return "role_select"
-        if _text_matches(body_text, "Your Scout seat is reserved") and _text_matches(body_text, "Verify my identity"):
+        if _text_matches(body_text, "Your Scout seat is reserved"):
             return "verify_identity"
+        if _text_matches(body_text, "Verify my identity"):
+            return "verify_identity"
+        if _text_matches(body_text, "Identity verified") and _text_matches(body_text, "has been verified in accordance"):
+            return "identity_verified"
+        if _text_matches(body_text, "Identity verified") and _text_matches(body_text, "AML"):
+            return "identity_verified"
         # Terms pages - most specific first
         if _text_matches(body_text, "Scout Terms \u2014 Addendum A"):
             return "terms_scout_addendum"
@@ -635,6 +643,9 @@ class SiteBot:
         if _text_matches(body_text, "Scout Dashboard") and _text_matches(body_text, "Start Validating Numbers"):
             return "scout_dashboard"
         if _text_matches(body_text, "Scout Dashboard"):
+            return "scout_dashboard"
+        # fallback: dashboard sidebar visible but title not in preview (e.g. after identity verified)
+        if _text_matches(body_text, "Dashboard") and _text_matches(body_text, "Total UPs gained") and _text_matches(body_text, "Test Numbers"):
             return "scout_dashboard"
         if _text_matches(body_text, "Settings") and _text_matches(body_text, "Delete Account"):
             return "settings_page"
@@ -823,6 +834,10 @@ class SiteBot:
 
     def do_no_active_license(self):
         log("STATE: no_active_license", "warn")
+        return True
+
+    def do_identity_verified(self):
+        log("STATE: identity_verified", "ok")
         return True
 
     def do_verify_identity(self):
