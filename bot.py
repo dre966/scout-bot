@@ -1,4 +1,6 @@
-"""Scout Bot - Docker-ready version. Automates phone number testing."""
+"""Scout Bot - Docker-ready version. Automates phone number testing.
+Refactored: STATE IDENTIFIER + DO_ACTION per state.
+"""
 
 import re
 import time
@@ -9,6 +11,7 @@ import requests
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import (
@@ -20,6 +23,28 @@ from selenium.common.exceptions import (
 import config as cfg
 
 PHONE_NUMBER_RE = re.compile(cfg.PHONE_NUMBER_PATTERN)
+
+STATES = [
+    "max_sessions",
+    "keep_testing_dialog",
+    "already_tested",
+    "resume_test",
+    "verification_ended",
+    "suspended",
+    "landing_page",
+    "test_numbers_list",
+    "nothing_to_scout",
+    "confirm_session",
+    "balance_entry",
+    "package_select",
+    "select_one",
+    "call_completed",
+    "verification_complete",
+    "call_this_number",
+    "continue_verification",
+    "call_result",
+    "unknown",
+]
 
 
 class BotLogger:
@@ -120,528 +145,422 @@ def build_container_xpath(classes):
 
 
 # ---------------------------------------------------------------------------
-# SiteBot
+# SiteBot - STATE IDENTIFIER + DO_ACTION
 # ---------------------------------------------------------------------------
 
 class SiteBot:
-    def __init__(self, driver, bot_id, port, api_base, sim_id):
+    def __init__(self, driver):
         self.driver = driver
-        self.bot_id = bot_id
-        self.port = port
-        self.api_base = api_base
-        self.sim_id = sim_id
-        self.logger = BotLogger(port)
-        self.state = "idle"
-        self.running = False
-        self.current_number = None
-        self.current_session_id = None
-        self.current_range_id = None
-        self.total_calls = 0
-        self.total_verifications = 0
-        self.disposition_history = []
+        self.container_xpath = build_container_xpath(cfg.CONTAINER_CLASSES)
+        self.noted_phone_number = None
+        self.tested_numbers = set()
+        self.test_start_time = None
+        self.stale_error_count = 0
+        self.current_sim = None
+        self.stored_verification_count = 0
+        self.call_count = 0
         self.used_ranges = set()
-        self.bearer_token = None
-        self.target_tab = None
-        self._load_bearer_token()
+        # BotLogger port: use DEBUGGER_PORT or fallback
+        _port = getattr(cfg, "DEBUGGER_PORT", getattr(cfg, "CHROME_DEBUG_PORT", 9222))
+        self.log = BotLogger(_port)
+        self.logger = self.log  # compat alias
+        self.session_disposition = None
+        self.session_disposition_category = None
+        self.empty_state_switch_count = 0
+        self.saved_dispositions = None
+        self.api_token = None
+        self.current_sim_id = None
 
-    # -- bearer token -------------------------------------------------------
+        # Dispatch dictionary: state -> handler
+        self.STATE_HANDLERS = {
+            "max_sessions": self.do_max_sessions,
+            "keep_testing_dialog": self.do_keep_testing_dialog,
+            "already_tested": self.do_already_tested,
+            "resume_test": self.do_resume_test,
+            "verification_ended": self.do_verification_ended,
+            "suspended": self.do_suspended,
+            "landing_page": self.do_landing_page,
+            "test_numbers_list": self.do_test_numbers_list,
+            "nothing_to_scout": self.do_nothing_to_scout,
+            "confirm_session": self.do_confirm_session,
+            "balance_entry": self.do_balance_entry,
+            "package_select": self.do_package_select,
+            "select_one": self.do_select_one,
+            "call_completed": self.do_call_completed,
+            "verification_complete": self.do_verification_complete,
+            "call_this_number": self.do_call_this_number,
+            "continue_verification": self.do_continue_verification,
+            "call_result": self.do_call_result,
+            "unknown": self.do_unknown,
+        }
 
-    def _load_bearer_token(self):
-        token_path = "/app/data/bearer_token.txt"
+    # -- generic helpers (kept) -------------------------------------------
+
+    def get_body_text(self):
+        """Full visible page text -- used for things that may render outside
+        the main container, like toasts or portal-based error messages."""
         try:
-            with open(token_path) as f:
-                self.bearer_token = f.read().strip()
-            log("Loaded bearer token", "ok")
-        except FileNotFoundError:
-            log(f"Bearer token file not found: {token_path}", "error")
-            raise
-
-    # -- disposition history ------------------------------------------------
-
-    def _record_disposition(self, disposition):
-        self.disposition_history.append(disposition)
-        self.logger.disposition_chosen(disposition)
-
-    def _recent_dispositions(self, n=5):
-        return self.disposition_history[-n:]
-
-    def _disposition_is_repeated(self, disposition):
-        recent = self._recent_dispositions(5)
-        return len(recent) >= 5 and all(d == disposition for d in recent)
-
-    def _pick_disposition(self):
-        dispositions = cfg.DISPOSITIONS[:]
-        random.shuffle(dispositions)
-        for d in dispositions:
-            if not self._disposition_is_repeated(d):
-                return d
-        return dispositions[0]
-
-    # -- page access --------------------------------------------------------
-
-    def _get_page(self, url, tab=None):
-        target = tab or self.driver
-        try:
-            target.get(url)
-            time.sleep(fixed_delay())
-            return True
-        except WebDriverException as e:
-            log(f"Failed to navigate: {e}", "error")
-            return False
-
-    def _current_url(self, tab=None):
-        target = tab or self.driver
-        try:
-            return target.current_url
-        except Exception:
+            return self.driver.execute_script("return document.body.innerText;") or ""
+        except WebDriverException:
             return ""
 
-    def _page_title(self, tab=None):
-        target = tab or self.driver
+    def get_container(self):
+        elements = self.driver.find_elements(By.XPATH, self.container_xpath)
+        return elements[0] if elements else None
+
+    def get_container_text(self):
+        container = self.get_container()
+        if container is None:
+            return ""
         try:
-            return target.title
-        except Exception:
+            return container.text
+        except StaleElementReferenceException:
             return ""
 
-    def _page_source_snippet(self, tab=None):
-        target = tab or self.driver
-        try:
-            src = target.page_source or ""
-            return src[:3000]
-        except Exception:
-            return ""
-
-    # -- element finders ----------------------------------------------------
-
-    def _find_element(self, by, value, tab=None):
-        target = tab or self.driver
-        try:
-            return target.find_element(by, value)
-        except NoSuchElementException:
-            return None
-
-    def _find_elements(self, by, value, tab=None):
-        target = tab or self.driver
-        try:
-            return target.find_elements(by, value)
-        except NoSuchElementException:
-            return []
-
-    def _find_by_xpath(self, xpath, tab=None):
-        return self._find_element(By.XPATH, xpath, tab)
-
-    def _find_by_css(self, css, tab=None):
-        return self._find_element(By.CSS_SELECTOR, css, tab)
-
-    def _find_by_id(self, id_val, tab=None):
-        return self._find_element(By.ID, id_val, tab)
-
-    def _find_by_text(self, tag, text, tab=None):
-        elements = self._find_elements(By.TAG_NAME, tag, tab)
-        for el in elements:
+    def find_button_with_text(self, text, within=None):
+        """Returns the first <button> whose visible text contains `text`,
+        searched page-wide by default, or scoped to `within` if given."""
+        scope = within if within is not None else self.driver
+        for btn in scope.find_elements(By.TAG_NAME, "button"):
             try:
-                if _text_matches(el.text, text):
-                    return el
+                if _text_matches(btn.text, text):
+                    return btn
             except StaleElementReferenceException:
                 continue
         return None
 
-    def _wait_for_element(self, by, value, timeout=10, tab=None):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            el = self._find_element(by, value, tab)
-            if el is not None:
-                return el
-            time.sleep(0.5)
-        return None
-
-    def _wait_for_xpath(self, xpath, timeout=10, tab=None):
-        return self._wait_for_element(By.XPATH, xpath, timeout, tab)
-
-    def _element_visible(self, element):
-        try:
-            return element.is_displayed()
-        except Exception:
+    def click(self, element, label="", retries=2, testing_mode=False):
+        if element is None:
             return False
+        for attempt in range(retries + 1):
+            try:
+                if testing_mode:
+                    delay = random_delay()
+                else:
+                    delay = fixed_delay()
+                time.sleep(delay)
+                human_pause()
+                human_scroll(self.driver)
+                human_mouse_move(self.driver, element)
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+                if cfg.HUMAN_LIKE_MODE and random.random() < cfg.DOUBLE_CLICK_CHANCE:
+                    actions = ActionChains(self.driver)
+                    actions.double_click(element).perform()
+                else:
+                    element.click()
+                self.stale_error_count = 0
+                return True
+            except StaleElementReferenceException:
+                if attempt < retries:
+                    time.sleep(0.3)
+                    continue
+                self.stale_error_count += 1
+                return False
+            except ElementClickInterceptedException:
+                if attempt < retries:
+                    time.sleep(0.8)
+                    try:
+                        self.driver.execute_script("arguments[0].click();", element)
+                        self.stale_error_count = 0
+                        return True
+                    except Exception:
+                        continue
+                return False
+            except WebDriverException:
+                return False
+        return False
 
-    def _element_text(self, element):
+    def type_into(self, element, text, label=""):
+        """Clicks an input to focus it, clears it, and types `text`."""
+        if element is None:
+            return False
         try:
-            return element.text
-        except Exception:
-            return ""
-
-    def _element_attr(self, element, attr):
-        try:
-            return element.get_attribute(attr)
-        except Exception:
-            return None
-
-    # -- click / type -------------------------------------------------------
-
-    def _safe_click(self, element, tab=None):
-        target = tab or self.driver
-        try:
-            human_mouse_move(target, element)
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+            human_mouse_move(self.driver, element)
             element.click()
             time.sleep(fixed_delay())
+            element.clear()
+            element.send_keys(text)
             return True
-        except ElementClickInterceptedException:
+        except (WebDriverException, StaleElementReferenceException):
+            return False
+
+    def parse_call_count(self):
+        """Parse 'Call X of 5' from page text to get actual call number."""
+        body_text = self.get_body_text()
+        match = re.search(r"Call\s+(\d+)\s+of\s+5", body_text)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def parse_verification_count(self):
+        """Parse 'Tests This Cycle' X/8 from page text."""
+        body_text = self.get_body_text()
+        match = re.search(r"Tests This Cycle.*?(\d+)/8", body_text, re.DOTALL)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _extract_phone_number(self, scope):
+        """Finds the phone number within `scope` (an element)."""
+        candidates = []
+        for span in scope.find_elements(By.TAG_NAME, "span"):
             try:
-                target.execute_script("arguments[0].click();", element)
-                time.sleep(fixed_delay())
-                return True
-            except Exception:
-                return False
-        except Exception:
-            return False
+                span_text = span.text or ""
+            except StaleElementReferenceException:
+                continue
+            match = PHONE_NUMBER_RE.search(span_text)
+            if match:
+                candidates.append((span, match.group(0)))
+        if not candidates:
+            return ""
+        for span, number in candidates:
+            css_class = span.get_attribute("class") or ""
+            if "truncate" in css_class:
+                return number
+        candidates.sort(key=lambda sn: len(re.sub(r"\D", "", sn[1])), reverse=True)
+        return candidates[0][1]
 
-    def _type_into(self, element, text, clear=True, tab=None):
-        target = tab or self.driver
+    def _extract_country_code(self, scope):
+        """Extract the 2-letter country code from a test number row."""
         try:
-            if clear:
-                element.clear()
-                time.sleep(0.1)
-            for ch in text:
-                element.send_keys(ch)
-                time.sleep(random.uniform(0.03, 0.09))
-            time.sleep(fixed_delay())
-            return True
-        except Exception:
-            return False
+            spans = scope.find_elements(By.TAG_NAME, "span")
+            for span in spans:
+                try:
+                    span_text = (span.text or "").strip()
+                except StaleElementReferenceException:
+                    continue
+                match = re.match(r'^([A-Z]{2})\b', span_text)
+                if match:
+                    return match.group(1)
+        except (NoSuchElementException, StaleElementReferenceException):
+            pass
+        return ""
 
-    def _press_enter(self, element=None, tab=None):
-        target = tab or self.driver
+    def find_test_number_rows(self):
+        """Finds every 'Test Number' button on the page, paired with the
+        phone number from its row."""
+        rows = []
+        buttons = self.driver.find_elements(
+            By.XPATH,
+            f".//button[contains(normalize-space(.), \"{cfg.TRIGGERS['test_number_button']}\")]"
+        )
+        for btn in buttons:
+            number_text = ""
+            country_code = ""
+            try:
+                row = btn.find_element(By.XPATH, "..")
+                number_text = self._extract_phone_number(row)
+                country_code = self._extract_country_code(row)
+            except (NoSuchElementException, StaleElementReferenceException):
+                pass
+            rows.append((btn, number_text, country_code))
+        return rows
+
+    def find_filter_toggle_button(self):
+        """Returns the number-filter dropdown's toggle <button>."""
+        svgs = self.driver.find_elements(By.CSS_SELECTOR, cfg.CHEVRON_SVG_SELECTOR)
+        for svg in svgs:
+            try:
+                return svg.find_element(By.XPATH, "./ancestor::button[1]")
+            except NoSuchElementException:
+                continue
+        return None
+
+    def get_filter_dropdown_options(self, toggle_button):
+        """Returns the option <button> elements in the dropdown panel."""
         try:
-            from selenium.webdriver.common.keys import Keys
-            el = element or target.switch_to.active_element
-            el.send_keys(Keys.RETURN)
-            time.sleep(fixed_delay())
-            return True
-        except Exception:
-            return False
+            panel = toggle_button.find_element(By.XPATH, "following-sibling::div[1]")
+        except (NoSuchElementException, StaleElementReferenceException):
+            return []
+        return panel.find_elements(By.TAG_NAME, "button")
 
-    # -- containers ---------------------------------------------------------
+    # -- state identifier --------------------------------------------------
 
-    def _find_container(self, classes, tab=None):
-        xpath = build_container_xpath(classes)
-        return self._find_by_xpath(xpath, tab)
+    def identify_state(self) -> str:
+        """Pure detection: returns a state string based SOLELY on page text /
+        DOM detection (no side effects). Respects priority order from
+        smart_call_yours.py tick()."""
+        body_text = self.get_body_text()
 
-    def _find_all_containers(self, classes, tab=None):
-        xpath = build_container_xpath(classes)
-        return self._find_elements(By.XPATH, xpath, tab)
-
-    # -- state machine steps ------------------------------------------------
-
-    def step_click_test_number(self):
-        log("Looking for test-number button...")
-        btn = self._find_by_css(cfg.TEST_NUMBER_CSS)
-        if btn and self._element_visible(btn):
-            self._safe_click(btn)
-            self.state = "confirm_session_and_start"
-            return True
-        btn = self._find_by_xpath(cfg.TEST_NUMBER_XPATH)
-        if btn and self._element_visible(btn):
-            self._safe_click(btn)
-            self.state = "confirm_session_and_start"
-            return True
-        log("Test-number button not found", "warn")
-        return False
-
-    def step_confirm_session_and_start(self):
-        log("Confirming session start...")
-        time.sleep(1)
-        start_btn = self._find_by_css(cfg.START_SESSION_CSS)
-        if start_btn and self._element_visible(start_btn):
-            self._safe_click(start_btn)
-            self.state = "enter_balance_and_continue"
-            return True
-        start_btn = self._find_by_xpath(cfg.START_SESSION_XPATH)
-        if start_btn and self._element_visible(start_btn):
-            self._safe_click(start_btn)
-            self.state = "enter_balance_and_continue"
-            return True
-        if _text_matches(self._page_source_snippet(), "already in session"):
-            log("Already in session, continuing", "warn")
-            self.state = "enter_balance_and_continue"
-            return True
-        log("Start-session button not found", "warn")
-        return False
-
-    def step_enter_balance_and_continue(self):
-        log("Looking for balance input...")
-        bal_input = self._find_by_css(cfg.BALANCE_INPUT_CSS)
-        if bal_input and self._element_visible(bal_input):
-            bal_input.clear()
-            self._type_into(bal_input, cfg.BALANCE_VALUE, clear=False)
-            time.sleep(0.3)
-            cont_btn = self._find_by_css(cfg.CONTINUE_CSS)
-            if cont_btn and self._element_visible(cont_btn):
-                self._safe_click(cont_btn)
-            else:
-                self._press_enter(bal_input)
-            self.state = "select_package_option"
-            return True
-        bal_input = self._find_by_xpath(cfg.BALANCE_INPUT_XPATH)
-        if bal_input and self._element_visible(bal_input):
-            bal_input.clear()
-            self._type_into(bal_input, cfg.BALANCE_VALUE, clear=False)
-            time.sleep(0.3)
-            cont_btn = self._find_by_xpath(cfg.CONTINUE_XPATH)
-            if cont_btn and self._element_visible(cont_btn):
-                self._safe_click(cont_btn)
-            else:
-                self._press_enter(bal_input)
-            self.state = "select_package_option"
-            return True
-        log("Balance input not found, maybe not needed", "warn")
-        self.state = "select_package_option"
-        return True
-
-    def step_select_package_option(self):
-        log("Selecting package option...")
-        time.sleep(1)
-        options = self._find_elements(By.CSS_SELECTOR, cfg.PACKAGE_OPTION_CSS)
-        if not options:
-            options = self._find_elements(By.XPATH, cfg.PACKAGE_OPTION_XPATH)
-        if options:
-            chosen = random.choice(options)
-            self._safe_click(chosen)
-            self.state = "select_one_option"
-            return True
-        log("No package options found", "warn")
-        self.state = "select_one_option"
-        return True
-
-    def step_select_one_option(self):
-        log("Selecting one option...")
-        time.sleep(1)
-        options = self._find_elements(By.CSS_SELECTOR, cfg.ONE_OPTION_CSS)
-        if not options:
-            options = self._find_elements(By.XPATH, cfg.ONE_OPTION_XPATH)
-        if options:
-            chosen = random.choice(options)
-            self._safe_click(chosen)
-            self.state = "call_this_number"
-            return True
-        log("No single options found", "warn")
-        self.state = "call_this_number"
-        return True
-
-    def step_call_this_number(self):
-        log("Looking for call button...")
-        time.sleep(1)
-        call_btn = self._find_by_css(cfg.CALL_BUTTON_CSS)
-        if call_btn and self._element_visible(call_btn):
-            self._safe_click(call_btn)
-            self.total_calls += 1
-            self.state = "continue_verification"
-            return True
-        call_btn = self._find_by_xpath(cfg.CALL_BUTTON_XPATH)
-        if call_btn and self._element_visible(call_btn):
-            self._safe_click(call_btn)
-            self.total_calls += 1
-            self.state = "continue_verification"
-            return True
-        log("Call button not found", "warn")
-        return False
-
-    def step_continue_verification(self):
-        log("Waiting for call page...")
-        time.sleep(cfg.CALL_WAIT_SECONDS)
-        ver_btn = self._find_by_css(cfg.VERIFY_CSS)
-        if ver_btn and self._element_visible(ver_btn):
-            self._safe_click(ver_btn)
-            self.total_verifications += 1
-            self.state = "submit_call_result"
-            return True
-        ver_btn = self._find_by_xpath(cfg.VERIFY_XPATH)
-        if ver_btn and self._element_visible(ver_btn):
-            self._safe_click(ver_btn)
-            self.total_verifications += 1
-            self.state = "submit_call_result"
-            return True
-        log("Verify button not found", "warn")
-        self.state = "submit_call_result"
-        return True
-
-    def step_submit_call_result(self):
-        log("Submitting call result (ban evasion: cancel attempt)...")
-        time.sleep(1)
-        cancel_btn = self._find_by_css(cfg.CANCEL_CSS)
-        if cancel_btn and self._element_visible(cancel_btn):
-            self._safe_click(cancel_btn)
-            time.sleep(0.5)
-        else:
-            cancel_btn = self._find_by_xpath(cfg.CANCEL_XPATH)
-            if cancel_btn and self._element_visible(cancel_btn):
-                self._safe_click(cancel_btn)
-                time.sleep(0.5)
-
-        disposition = self._pick_disposition()
-        self._record_disposition(disposition)
-        log(f"Disposition: {disposition}", "ok")
-
-        submit_btn = self._find_by_css(cfg.SUBMIT_CSS)
-        if submit_btn and self._element_visible(submit_btn):
-            self._safe_click(submit_btn)
-        else:
-            submit_btn = self._find_by_xpath(cfg.SUBMIT_XPATH)
-            if submit_btn and self._element_visible(submit_btn):
-                self._safe_click(submit_btn)
-
-        self.state = "start_next_call"
-        return True
-
-    def step_start_next_call(self):
-        log("Preparing next call...")
-        time.sleep(fixed_delay())
-        self.state = "call_this_number"
-        return True
-
-    def step_verification_complete(self):
-        log("Verification complete", "ok")
-        self.state = "start_next_call"
-        return True
-
-    def step_verification_ended(self):
-        log("Verification ended by remote", "warn")
-        self.state = "start_next_call"
-        return True
-
-    def step_suspended(self):
-        log("Suspended! Waiting 60s before continuing...", "warn")
-        self.logger.session_terminal("suspended")
-        time.sleep(60)
-        self.state = "start_next_call"
-        return True
-
-    def step_already_tested_back_and_retry(self):
-        log("Number already tested, going back...", "warn")
-        back_btn = self._find_by_css(cfg.BACK_CSS)
-        if back_btn and self._element_visible(back_btn):
-            self._safe_click(back_btn)
-        else:
-            back_btn = self._find_by_xpath(cfg.BACK_XPATH)
-            if back_btn and self._element_visible(back_btn):
-                self._safe_click(back_btn)
-            else:
-                self.driver.back()
-        time.sleep(fixed_delay())
-        self.state = "call_this_number"
-        return True
-
-    def step_dismiss_max_sessions(self):
-        log("Max sessions reached, dismissing...", "warn")
-        ok_btn = self._find_by_css(cfg.OK_CSS)
-        if ok_btn and self._element_visible(ok_btn):
-            self._safe_click(ok_btn)
-        else:
-            ok_btn = self._find_by_xpath(cfg.OK_XPATH)
-            if ok_btn and self._element_visible(ok_btn):
-                self._safe_click(ok_btn)
-        self.state = "start_next_call"
-        return True
-
-    def recovery_find_available_sim(self):
-        log("Recovery: looking for available SIM...", "warn")
-        time.sleep(5)
-        self.state = "call_this_number"
-        return True
-
-    def _detect_page_state(self):
-        src = self._page_source_snippet()
-        url = self._current_url()
-        if _text_matches(src, "already tested") or _text_matches(src, "already been tested"):
-            return "already_tested"
-        if _text_matches(src, "max session") or _text_matches(src, "maximum sessions"):
+        # 1. max_sessions (page-wide first, every tick)
+        if _text_matches(body_text, cfg.TRIGGERS["max_sessions_label"]):
             return "max_sessions"
-        if _text_matches(src, "suspended") or _text_matches(src, "suspended."):
-            return "suspended"
-        if _text_matches(src, "verification complete") or _text_matches(src, "successfully verified"):
-            return "verification_complete"
-        if _text_matches(src, "verification ended") or _text_matches(src, "call ended"):
+
+        # 2. keep_testing_dialog (check button exists, regardless of call_count)
+        if self.find_button_with_text(cfg.TRIGGERS["keep_testing_button"]) is not None:
+            return "keep_testing_dialog"
+
+        # 3. already_tested
+        if _text_matches(body_text, cfg.TRIGGERS["already_tested_label"]):
+            return "already_tested"
+
+        # 4. resume_test
+        if _text_matches(body_text, cfg.TRIGGERS["resume_test_label"]):
+            return "resume_test"
+
+        # 5. verification_ended
+        if _text_matches(body_text, cfg.TRIGGERS["verification_ended_label"]):
             return "verification_ended"
-        if "landing" in url.lower() or _text_matches(src, "landing page"):
+
+        # 6. suspended
+        if _text_matches(body_text, cfg.TRIGGERS["suspended_label"]):
+            return "suspended"
+
+        # 7. landing_page
+        if _text_matches(body_text, cfg.TRIGGERS["landing_page_label"]):
             return "landing_page"
-        if _text_matches(src, "test number") or _text_matches(src, "start session"):
-            return "test_number"
-        if _text_matches(src, "enter balance") or _text_matches(src, "balance"):
-            return "balance"
-        if _text_matches(src, "package") or _text_matches(src, "select option"):
-            return "package"
-        if _text_matches(src, "call now") or _text_matches(src, "calling"):
-            return "calling"
-        if _text_matches(src, "verify") or _text_matches(src, "verification"):
-            return "verification"
+
+        # 8. test_numbers_list (via find_test_number_rows)
+        rows = self.find_test_number_rows()
+        if rows:
+            return "test_numbers_list"
+
+        # 9. nothing_to_scout
+        if _text_matches(body_text, cfg.TRIGGERS["nothing_to_scout_label"]):
+            return "nothing_to_scout"
+
+        # 10. confirm_session / balance_entry / package_select / select_one / call_completed / verification_complete / call_this_number / continue_verification / call_result
+        if _text_matches(body_text, cfg.TRIGGERS["confirm_session_label"]):
+            return "confirm_session"
+        if _text_matches(body_text, cfg.TRIGGERS["balance_entry_label"]):
+            return "balance_entry"
+        if _text_matches(body_text, cfg.TRIGGERS["package_label"]):
+            return "package_select"
+        if _text_matches(body_text, cfg.TRIGGERS["select_one_label"]):
+            return "select_one"
+        if _text_matches(body_text, cfg.TRIGGERS["call_completed_label"]):
+            return "call_completed"
+        if _text_matches(body_text, cfg.TRIGGERS["verification_complete_label"]):
+            return "verification_complete"
+        if _text_matches(body_text, cfg.TRIGGERS["call_this_number_label"]):
+            return "call_this_number"
+        if _text_matches(body_text, cfg.TRIGGERS["continue_verification_label"]):
+            return "continue_verification"
+        if _text_matches(body_text, cfg.TRIGGERS["call_result_label"]):
+            return "call_result"
+
+        # 11. unknown (fallback) - debug preview
+        preview = body_text[:120].replace("\n", " ") if body_text else ""
+        log(f"unknown state - page preview: '{preview}...'", "warn")
         return "unknown"
 
-    # -- tick dispatcher ----------------------------------------------------
+    # -- do_* handler stubs (template) ------------------------------------
 
-    def tick(self):
-        dispatch = {
-            "idle": lambda: self._goto_first_page(),
-            "confirm_session_and_start": self.step_confirm_session_and_start,
-            "enter_balance_and_continue": self.step_enter_balance_and_continue,
-            "select_package_option": self.step_select_package_option,
-            "select_one_option": self.step_select_one_option,
-            "call_this_number": self.step_call_this_number,
-            "continue_verification": self.step_continue_verification,
-            "submit_call_result": self.step_submit_call_result,
-            "start_next_call": self.step_start_next_call,
-            "verification_complete": self.step_verification_complete,
-            "verification_ended": self.step_verification_ended,
-            "suspended": self.step_suspended,
-            "already_tested_back_and_retry": self.step_already_tested_back_and_retry,
-            "max_sessions": self.step_dismiss_max_sessions,
-            "recovery": self.recovery_find_available_sim,
-        }
-        page = self._detect_page_state()
-        if page == "suspended":
-            self.state = "suspended"
-        elif page == "max_sessions":
-            self.state = "max_sessions"
-        elif page == "already_tested":
-            self.state = "already_tested_back_and_retry"
-        elif page == "verification_complete":
-            self.state = "verification_complete"
-        elif page == "verification_ended":
-            self.state = "verification_ended"
-        elif page == "landing_page":
-            log("Landing page detected - cannot proceed via ADB in Docker", "warn")
-            return False
+    def do_max_sessions(self):
+        log("STATE: max_sessions", "warn")
+        return True
 
-        handler = dispatch.get(self.state)
-        if handler:
-            return handler()
-        log(f"Unknown state: {self.state}", "error")
+    def do_keep_testing_dialog(self):
+        log("STATE: keep_testing_dialog", "warn")
+        return True
+
+    def do_already_tested(self):
+        log("STATE: already_tested", "warn")
+        return True
+
+    def do_resume_test(self):
+        log("STATE: resume_test")
+        return True
+
+    def do_verification_ended(self):
+        log("STATE: verification_ended", "warn")
+        return True
+
+    def do_suspended(self):
+        log("STATE: suspended", "error")
+        return True
+
+    def do_landing_page(self):
+        log("STATE: landing_page", "warn")
+        return True
+
+    def do_test_numbers_list(self):
+        log("STATE: test_numbers_list", "ok")
+        return True
+
+    def do_nothing_to_scout(self):
+        log("STATE: nothing_to_scout", "warn")
+        return True
+
+    def do_confirm_session(self):
+        log("STATE: confirm_session")
+        return True
+
+    def do_balance_entry(self):
+        log("STATE: balance_entry")
+        return True
+
+    def do_package_select(self):
+        log("STATE: package_select")
+        return True
+
+    def do_select_one(self):
+        log("STATE: select_one")
+        return True
+
+    def do_call_completed(self):
+        log("STATE: call_completed", "ok")
+        return True
+
+    def do_verification_complete(self):
+        log("STATE: verification_complete", "ok")
+        return True
+
+    def do_call_this_number(self):
+        log("STATE: call_this_number")
+        return True
+
+    def do_continue_verification(self):
+        log("STATE: continue_verification")
+        return True
+
+    def do_call_result(self):
+        log("STATE: call_result")
+        return True
+
+    def do_unknown(self):
+        log("STATE: unknown - no handler", "error")
+        try:
+            body = self.get_body_text()
+            preview = body[:200].replace("\n", " ") if body else ""
+            log(f"unknown page preview: '{preview}...'", "error")
+        except Exception:
+            pass
         return False
 
-    def _goto_first_page(self):
-        if not self._get_page(cfg.TARGET_URL):
-            return False
-        page = self._detect_page_state()
-        if page == "test_number":
-            self.state = "click_test_number"
-            return self.step_click_test_number()
-        elif page == "landing_page":
-            log("Landing page - cannot use ADB in Docker", "warn")
-            return False
-        else:
-            self.state = "call_this_number"
-            return True
+    # -- tick dispatcher (two-phase) ---------------------------------------
+
+    def tick(self):
+        state = self.identify_state()
+        log(f"[state] {state}")
+        handler = self.STATE_HANDLERS.get(state, self.do_unknown)
+        return handler()
 
 
 # ---------------------------------------------------------------------------
 # Chrome / tab helpers
 # ---------------------------------------------------------------------------
 
-def connect_to_chrome(port):
+def connect_to_chrome(port=None):
+    # Resolve port: explicit arg > env > config
+    if port is None:
+        try:
+            port = int(os.environ.get("CHROME_PORT", os.environ.get("DEBUGGER_PORT", "")) or getattr(cfg, "DEBUGGER_PORT", getattr(cfg, "CHROME_DEBUG_PORT", 9222)))
+        except Exception:
+            port = 9222
     opts = Options()
     opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    # Also try Service if CHROMEDRIVER_PATH is set (compat with legacy)
+    chromedriver_path = getattr(cfg, "CHROMEDRIVER_PATH", None)
     try:
-        driver = webdriver.Chrome(options=opts)
+        if chromedriver_path and os.path.exists(chromedriver_path):
+            service = Service(executable_path=chromedriver_path)
+            driver = webdriver.Chrome(service=service, options=opts)
+        else:
+            driver = webdriver.Chrome(options=opts)
         log(f"Connected to Chrome on port {port}", "ok")
         return driver
     except WebDriverException as e:
@@ -649,7 +568,9 @@ def connect_to_chrome(port):
         return None
 
 
-def switch_to_target_tab(driver, url_substring):
+def switch_to_target_tab(driver, url_substring=None):
+    if url_substring is None:
+        url_substring = getattr(cfg, "TARGET_URL_SUBSTRING", getattr(cfg, "SITE_DOMAIN", "scout"))
     handles = driver.window_handles
     for h in handles:
         driver.switch_to.window(h)
@@ -668,35 +589,47 @@ def switch_to_target_tab(driver, url_substring):
 # ---------------------------------------------------------------------------
 
 def run():
-    port = int(os.environ.get("CHROME_PORT", cfg.CHROME_DEBUG_PORT))
-    api_base = os.environ.get("API_BASE", cfg.API_BASE_URL)
-    sim_id = os.environ.get("SIM_ID", cfg.DEFAULT_SIM_ID)
-    bot_id = os.environ.get("BOT_ID", f"bot_{port}")
-
+    # Support both DEBUGGER_PORT and CHROME_DEBUG_PORT naming
+    default_port = getattr(cfg, "DEBUGGER_PORT", getattr(cfg, "CHROME_DEBUG_PORT", 9222))
+    port = int(os.environ.get("CHROME_PORT", os.environ.get("DEBUGGER_PORT", default_port)))
     driver = connect_to_chrome(port)
     if driver is None:
         return
 
-    switch_to_target_tab(driver, cfg.TARGET_URL_SUBSTRING)
+    # Switch to target tab (best-effort)
+    try:
+        switch_to_target_tab(driver, getattr(cfg, "TARGET_URL_SUBSTRING", getattr(cfg, "SITE_DOMAIN", "")))
+    except Exception:
+        pass
 
-    bot = SiteBot(driver, bot_id, port, api_base, sim_id)
+    bot = SiteBot(driver)
+    # compat: expose running flag if needed
     bot.running = True
-    log(f"Bot {bot_id} started on port {port}", "ok")
+    log(f"Bot started on port {port}", "ok")
 
-    while bot.running:
+    while getattr(bot, "running", True):
         try:
             bot.tick()
             time.sleep(random_delay())
         except KeyboardInterrupt:
             log("Interrupted by user", "warn")
             bot.running = False
+        except SystemExit as e:
+            log(f"Exit: {e}", "warn")
+            break
         except Exception as e:
             log(f"Tick error: {e}", "error")
-            bot.logger.error(str(e))
+            try:
+                bot.log.error(str(e))
+            except Exception:
+                pass
             time.sleep(5)
 
     log("Bot stopped", "ok")
-    bot.logger.session_complete(bot.total_calls, bot.total_verifications)
+    try:
+        bot.log.session_complete(getattr(bot, "call_count", 0), getattr(bot, "stored_verification_count", 0))
+    except Exception:
+        pass
 
 
 def main():
