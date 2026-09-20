@@ -440,6 +440,23 @@ class SiteBot:
                 continue
         return None
 
+    def _is_tab_active(self, tab_text):
+        """Return True if a tab button with tab_text has active class (border-white)."""
+        try:
+            for btn in self.driver.find_elements(By.TAG_NAME, "button"):
+                try:
+                    if _text_matches(btn.text, tab_text):
+                        cls = btn.get_attribute("class") or ""
+                        if "border-white" in cls or "text-white" in cls and "border-b-2" in cls:
+                            # need border-white specifically for active tab
+                            if "border-white" in cls:
+                                return True
+                except StaleElementReferenceException:
+                    continue
+        except Exception:
+            pass
+        return False
+
     def get_filter_dropdown_options(self, toggle_button):
         """Returns the option <button> elements in the dropdown panel."""
         try:
@@ -544,38 +561,45 @@ class SiteBot:
             # Check dropdown early: if toggle expanded, treat as dropdown
             try:
                 _toggle = self.find_filter_toggle_button()
-                if _toggle is not None and len(self.get_filter_dropdown_options(_toggle)) > 1:
-                    return "test_numbers_sim_dropdown"
+                if _toggle is not None:
+                    try:
+                        _chev = _toggle.find_element(By.CSS_SELECTOR, cfg.CHEVRON_SVG_SELECTOR)
+                        _is_exp = "rotate-180" in (_chev.get_attribute("class") or "")
+                    except Exception:
+                        _is_exp = False
+                    if _is_exp and len(self.get_filter_dropdown_options(_toggle)) > 1:
+                        return "test_numbers_sim_dropdown"
             except Exception:
                 pass
             return "test_numbers_my_promoted"
-        # My Verified Numbers: unique content "0 of 5 verified" appears only on verified tab (not on promoted/available)
-        if _text_matches(body_text, "My Verified Numbers") and _text_matches(body_text, "0 of 5 verified"):
+        # Tabs: check active tab via DOM class border-white (most reliable). All Test Numbers pages contain all 3 tab labels, so text match alone misclassifies.
+        if self._is_tab_active("My Promoted Numbers"):
+            return "test_numbers_my_promoted"
+        if self._is_tab_active("My Verified Numbers"):
             return "test_numbers_my_verified"
-        # fallback: if body contains My Verified label but not promoted empty and not available, still treat as verified
-        # but avoid misclassifying available/promoted which also have label; require absence of promoted empty
-        if _text_matches(body_text, "My Verified Numbers") and not _text_matches(body_text, "None of your tested numbers are promoted yet"):
-            # if page has Test Numbers and My Verified but no verified content, it could still be verified empty state
-            # For now, only return verified if we see verified-specific marker; otherwise fall through to available
-            pass
-        # SIM dropdown expanded: Available Numbers + dropdown options >1
-        if _text_matches(body_text, "Available Numbers") and _text_matches(body_text, "Test Numbers"):
+        if self._is_tab_active("Available Numbers"):
+            # if dropdown open, prioritize dropdown (already handled above via rotate-180), but re-check here in case promoted check didn't fire
+            # dropdown already returns before this, so safe to return available
+            return "test_numbers_available"
+        # SIM dropdown expanded: only when chevron is rotated (dropdown open) - check here as fallback if promoted check didn't fire
+        if _text_matches(body_text, "Test Numbers"):
             try:
                 toggle = self.find_filter_toggle_button()
                 if toggle is not None:
-                    opts = self.get_filter_dropdown_options(toggle)
-                    if len(opts) > 1:
-                        return "test_numbers_sim_dropdown"
-                    if _text_matches(body_text, "Unlimited Starter") or _text_matches(body_text, "US Mobile"):
-                        if _text_matches(body_text, "Unlimited Starter + International calling"):
+                    # check if dropdown is actually expanded: chevron has rotate-180
+                    try:
+                        chevron = toggle.find_element(By.CSS_SELECTOR, cfg.CHEVRON_SVG_SELECTOR)
+                        chevron_classes = chevron.get_attribute("class") or ""
+                        is_expanded = "rotate-180" in chevron_classes
+                    except Exception:
+                        is_expanded = False
+                    if is_expanded:
+                        opts = self.get_filter_dropdown_options(toggle)
+                        if len(opts) > 1:
                             return "test_numbers_sim_dropdown"
             except Exception:
                 pass
-        # test_numbers_available: main Available Numbers tab active
-        if _text_matches(body_text, "Available Numbers") and _text_matches(body_text, "Test Numbers"):
-            return "test_numbers_available"
-
-        # generic test_numbers_list (via find_test_number_rows)
+        # generic test_numbers_list (via find_test_number_rows) - fallback for Available Numbers when tab active check missed
         rows = self.find_test_number_rows()
         if rows:
             return "test_numbers_list"
@@ -590,8 +614,28 @@ class SiteBot:
             return "package_select"
         if _text_matches(body_text, cfg.TRIGGERS["select_one_label"]):
             return "select_one"
+        # ---- 6. Extended app pages (scout) - MUST be before call_completed
+        # call_completed label "Completed" is too generic (matches "Completed test" on dashboard and "Call Completed" toggle on settings)
+        if _text_matches(body_text, "Scout Dashboard") and _text_matches(body_text, "Start Validating Numbers"):
+            return "scout_dashboard"
+        if _text_matches(body_text, "Scout Dashboard"):
+            return "scout_dashboard"
+        if _text_matches(body_text, "Settings") and _text_matches(body_text, "Delete Account"):
+            return "settings_page"
+        if _text_matches(body_text, "Runner Settings") or _text_matches(body_text, "Manage your runner profile"):
+            return "settings_page"
+        if _text_matches(body_text, "Scout Settings") or _text_matches(body_text, "Manage your scout profile"):
+            return "settings_page"
+
         if _text_matches(body_text, cfg.TRIGGERS["call_completed_label"]):
-            return "call_completed"
+            # tighten: real call_completed page has "Call X of 5 Completed", not just "Completed"
+            if re.search(r"Call\s*\d+\s*of\s*5", body_text, re.IGNORECASE):
+                return "call_completed"
+            # fallback: require "Call" nearby "Completed"
+            if _text_matches(body_text, "Call") and _text_matches(body_text, "Completed"):
+                # but exclude settings notification toggle and dashboard recent activity
+                if "Scout Dashboard" not in body_text and "Settings" not in body_text:
+                    return "call_completed"
         if _text_matches(body_text, cfg.TRIGGERS["verification_complete_label"]):
             return "verification_complete"
         if _text_matches(body_text, cfg.TRIGGERS["call_this_number_label"]):
@@ -600,12 +644,6 @@ class SiteBot:
             return "continue_verification"
         if _text_matches(body_text, cfg.TRIGGERS["call_result_label"]):
             return "call_result"
-
-        # ---- 6. Extended app pages (scout) ----
-        if _text_matches(body_text, "Scout Dashboard") and _text_matches(body_text, "Start Validating Numbers"):
-            return "scout_dashboard"
-        if _text_matches(body_text, "Scout Dashboard"):
-            return "scout_dashboard"
         if _text_matches(body_text, "SIM Management") and _text_matches(body_text, "Total SIMs"):
             return "sims_page"
         if _text_matches(body_text, "Select an approved call plan"):
@@ -650,13 +688,7 @@ class SiteBot:
         if _text_matches(body_text, "My SIMs"):
             return "runner_sims_page"
 
-        # ---- 8. Settings ----
-        if _text_matches(body_text, "Runner Settings") or _text_matches(body_text, "Manage your runner profile"):
-            return "settings_page"
-        if _text_matches(body_text, "Scout Settings") or _text_matches(body_text, "Manage your scout profile"):
-            return "settings_page"
-        if _text_matches(body_text, "Settings") and _text_matches(body_text, "Delete Account"):
-            return "settings_page"
+        # ---- 8. Settings (already handled above before call_completed, kept here as fallback) ----
 
         # ---- 9. unknown (fallback) ----
         preview = body_text[:120].replace("\n", " ") if body_text else ""
