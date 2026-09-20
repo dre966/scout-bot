@@ -45,8 +45,10 @@ EXPOSE 9222 5900 6080
 
 ENTRYPOINT ["/bin/bash", "-c", "\
     Xvfb :99 -screen 0 1920x1080x24 & \
-    x11vnc -display :99 -forever -nopw -rfbport 5900 & \
+    sleep 2 && \
+    x11vnc -display :99 -forever -nopw -rfbport 5900 -auth guess & \
     websockify --web /usr/share/novnc/ 6080 localhost:5900 & \
-    google-chrome --remote-debugging-port=9222 --no-sandbox --disable-gpu --window-size=1920,1080 --display=:99 & \
+    sleep 1 && \
+    google-chrome --remote-debugging-port=9222 --no-sandbox --disable-dev-shm-usage --disable-gpu --window-size=1920,1080 --disable-software-rasterizer --remote-allow-origins=* & \
     sleep 3 && \
     exec python bot.py"]
