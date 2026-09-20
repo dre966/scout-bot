@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+data/
+logs/
+tested_numbers.json
+honeypot_data.json
+config.json
+proxies.txt
+*.json
+!package.json

@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  scout-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: scout-bot-1
+    ports:
+      - "9222:9222"
+      - "5900:5900"
+      - "6080:6080"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - BOT_MODE=2
+      - API_PAIRING=true
+      - POLL_INTERVAL=1.0
+      - HUMAN_LIKE_MODE=true
+    restart: unless-stopped
