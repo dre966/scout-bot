@@ -7,4 +7,4 @@ x11vnc -display :99 -forever -nopw -rfbport 5900 &
 websockify --web /usr/share/novnc/ 6080 localhost:5900 &
 sleep 2
 echo "[entrypoint] Xvfb/VNC ready, starting bot (chrome will be launched by selenium)..."
-exec python bot.py
+exec python -u bot.py

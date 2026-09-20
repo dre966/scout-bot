@@ -38,6 +38,7 @@ COPY . .
 RUN chmod +x /usr/local/bin/chromedriver
 
 ENV DISPLAY=:99
+ENV PYTHONUNBUFFERED=1
 ENV CHROME_FLAGS="--remote-debugging-port=9222 --no-sandbox --disable-gpu --window-size=1920,1080"
 
 VOLUME ["/app/data", "/app/logs"]
