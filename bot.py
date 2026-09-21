@@ -2297,16 +2297,148 @@ class SiteBot:
             log(f"license_select: Continue click failed: {e}", "error")
             return False
 
+    def _select_country_us(self):
+        # Helper: open country dropdown and pick US / United States
+        try:
+            # Click dropdown trigger
+            trigger = None
+            for sel in ['button', 'div[role="combobox"]', 'input[placeholder*="country" i]']:
+                try:
+                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                    for el in els:
+                        try:
+                            txt = (el.text or "") + (el.get_attribute("placeholder") or "")
+                            if "Choose a country" in txt or "Select your country" in txt or "country" in txt.lower():
+                                trigger = el
+                                break
+                        except: continue
+                    if trigger: break
+                except: continue
+            if trigger is None:
+                trigger = self.find_button_with_text("Choose a country")
+            if trigger is None:
+                trigger = self.find_button_with_text("Select your country")
+            if trigger is not None:
+                self.click(trigger, label="country dropdown")
+                time.sleep(1)
+            # Pick US
+            us_opt = None
+            for txt in ["United States", "US -", "US ", "United States of America"]:
+                us_opt = self.find_button_with_text(txt)
+                if us_opt: break
+            if us_opt is None:
+                # search div options
+                for el in self.driver.find_elements(By.TAG_NAME, "div"):
+                    try:
+                        if "United States" in (el.text or ""):
+                            us_opt = el
+                            break
+                    except: continue
+            if us_opt is not None:
+                self.click(us_opt, label="US option")
+                time.sleep(0.8)
+                return True
+        except Exception as e:
+            log(f"_select_country_us failed: {e}", "warn")
+        return False
+
+    def _click_continue(self, label="Continue"):
+        for txt in [label, "Continue", "Next", "Continue as Scout", "Continue as Runner"]:
+            btn = self.find_button_with_text(txt)
+            if btn is not None:
+                # wait if disabled
+                for _ in range(5):
+                    try:
+                        if btn.get_attribute("disabled") is not None: time.sleep(0.5); continue
+                        break
+                    except: break
+                self.click(btn, label=txt)
+                time.sleep(1.2)
+                return True
+        b = self._find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+        if b is not None:
+            self.click(b, label="submit")
+            time.sleep(1.2)
+            return True
+        return False
+
+    def _handle_terms_scroll_and_accept(self):
+        # Terms pages require scrolling to bottom to enable checkbox/continue
+        try:
+            # scroll main window
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.5)
+            # scroll any scrollable div containing terms
+            self.driver.execute_script("""
+                var els=document.querySelectorAll('div');
+                for(var i=0;i<els.length;i++){
+                  var e=els[i];
+                  if(e.scrollHeight>e.clientHeight+50){
+                    e.scrollTop=e.scrollHeight;
+                  }
+                }
+                window.scrollTo(0, document.body.scrollHeight);
+            """)
+            time.sleep(0.8)
+            # check "I have read and accept" checkbox
+            chk = None
+            for sel in ['input[type="checkbox"]', 'button[role="checkbox"]', 'div[role="checkbox"]']:
+                try:
+                    els=self.driver.find_elements(By.CSS_SELECTOR, sel)
+                    for el in els:
+                        try:
+                            if el.is_displayed():
+                                chk=el
+                                break
+                        except: continue
+                    if chk: break
+                except: continue
+            if chk is None:
+                # fallback text search
+                for el in self.driver.find_elements(By.TAG_NAME, "label"):
+                    try:
+                        if "I have read and accept" in (el.text or ""):
+                            chk=el
+                            break
+                    except: continue
+            if chk is not None:
+                try:
+                    if chk.tag_name.lower()=="input":
+                        if not chk.is_selected():
+                            self.click(chk, label="terms checkbox")
+                    else:
+                        self.click(chk, label="terms checkbox")
+                    time.sleep(0.6)
+                except Exception as e:
+                    log(f"terms checkbox click failed: {e}", "warn")
+            return True
+        except Exception as e:
+            log(f"_handle_terms_scroll failed: {e}", "warn")
+            return False
+
     def do_country_select(self):
-        log("STATE: country_select", "info")
+        log("STATE: country_select - selecting US", "info")
+        self._select_country_us()
+        time.sleep(0.5)
+        self._click_continue("Continue")
         return True
 
     def do_role_select(self):
-        log("STATE: role_select", "info")
+        log("STATE: role_select - Continue as Scout", "info")
+        btn = self.find_button_with_text("Continue as Scout")
+        if btn is None: btn = self.find_button_with_text("Scout")
+        if btn is not None: self.click(btn, label="Continue as Scout"); time.sleep(1)
+        self._click_continue("Continue")
         return True
 
     def do_country_role_select(self):
-        log("STATE: country_role_select", "info")
+        log("STATE: country_role_select - US + Scout", "info")
+        self._select_country_us()
+        time.sleep(0.5)
+        btn = self.find_button_with_text("Continue as Scout")
+        if btn is None: btn = self.find_button_with_text("Scout")
+        if btn is not None: self.click(btn, label="Scout"); time.sleep(0.8)
+        self._click_continue("Continue")
         return True
 
     def do_no_active_license(self):
@@ -2314,28 +2446,42 @@ class SiteBot:
         return True
 
     def do_identity_verified(self):
-        log("STATE: identity_verified", "ok")
+        log("STATE: identity_verified - continue", "ok")
+        self._click_continue("Continue")
         return True
 
     def do_verify_identity(self):
-        log("STATE: verify_identity", "info")
+        log("STATE: verify_identity - clicking Verify my identity", "info")
+        btn = self.find_button_with_text("Verify my identity")
+        if btn is None: btn = self.find_button_with_text("Verify")
+        if btn is not None:
+            self.click(btn, label="Verify my identity")
+            time.sleep(2)
+            return True
+        log("verify_identity: button not found", "warn")
+        return False
+
+    def _do_terms(self, name):
+        log(f"STATE: {name} - scrolling and accepting", "info")
+        self._handle_terms_scroll_and_accept()
+        time.sleep(0.5)
+        # After accepting, click Continue/Agree
+        if not self._click_continue("Continue"):
+            self._click_continue("Agree")
+            self._click_continue("Accept")
         return True
 
     def do_terms_service(self):
-        log("STATE: terms_service", "info")
-        return True
+        return self._do_terms("terms_service")
 
     def do_terms_scout_addendum(self):
-        log("STATE: terms_scout_addendum", "info")
-        return True
+        return self._do_terms("terms_scout_addendum")
 
     def do_terms_runner_addendum(self):
-        log("STATE: terms_runner_addendum", "info")
-        return True
+        return self._do_terms("terms_runner_addendum")
 
     def do_terms_privacy(self):
-        log("STATE: terms_privacy", "info")
-        return True
+        return self._do_terms("terms_privacy")
 
     def do_scout_dashboard(self):
         # Only called when identify_state returns scout_dashboard (idle, not mid-verification)
