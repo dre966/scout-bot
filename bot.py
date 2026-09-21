@@ -23,6 +23,12 @@ from selenium.common.exceptions import (
 )
 import config as cfg
 
+
+class NoSimsRegistered(Exception):
+    """Raised when scout dashboard has 0 SIMs registered - server should notify."""
+    pass
+
+
 # OTP / Gmail helpers - lazy import to keep bot runnable without google deps installed
 try:
     from utils.otp import get_proxy_for_bot as _get_proxy_for_bot
@@ -1469,7 +1475,98 @@ class SiteBot:
         return True
 
     def do_scout_dashboard(self):
+        # Only called when identify_state returns scout_dashboard (idle, not mid-verification)
+        # Requirement: not in between any movements - identify_state == scout_dashboard already guarantees idle.
         log("STATE: scout_dashboard", "info")
+        # Navigate to SIMs page to check if any SIMs are registered
+        try:
+            self.driver.get(cfg.SIMS_PAGE_URL)
+        except Exception as e:
+            log(f"scout_dashboard: failed to navigate to SIMs page {cfg.SIMS_PAGE_URL}: {e}", "error")
+            self.log.error("scout_dashboard: SIMs navigation failed", details={"url": cfg.SIMS_PAGE_URL, "error": str(e)})
+            return False
+        # Wait 2-3 seconds for page to load (keep timing note: first OTP sometimes wrong due to timing, but success on second try - don't block login flow)
+        time.sleep(random.uniform(2, 3))
+
+        body_text = self.get_body_text()
+
+        # --- Detection: parse "Total SIMs N" ---
+        sim_count = None
+        m = re.search(r"Total SIMs\s*(\d+)", body_text, re.IGNORECASE)
+        if m:
+            try:
+                sim_count = int(m.group(1))
+            except ValueError:
+                sim_count = None
+
+        # --- Detection: DOM card count ---
+        card_count = 0
+        phone_count = 0
+        try:
+            # Rounded bordered cards used for SIM entries (similar to original find_available_sims)
+            cards = self.driver.find_elements(By.CSS_SELECTOR, "[class*='rounded-'][class*='border-'][class*='bg-']")
+            # Count cards that contain a phone number to avoid decorative containers
+            phone_cards = 0
+            for c in cards:
+                try:
+                    txt = c.text or ""
+                    if PHONE_NUMBER_RE.search(txt):
+                        phone_cards += 1
+                except StaleElementReferenceException:
+                    continue
+            # Prefer phone-bearing cards; fallback to raw card count only if phone_cards is 0 but cards exist and look like SIM cards
+            # We keep card_count as phone_cards if any found, else 0 to avoid false positives from layout divs
+            card_count = phone_cards
+            # Also count phone numbers via regex on body_text (catches "+1" patterns etc.)
+            phone_numbers = PHONE_NUMBER_RE.findall(body_text)
+            # Filter to numbers with at least 7 digits (strip non-digits)
+            filtered = [p for p in phone_numbers if len(re.sub(r"\D", "", p)) >= 7]
+            phone_count = len(filtered)
+        except Exception:
+            pass
+
+        # --- Determine zero SIMs ---
+        is_zero = False
+        if sim_count is not None:
+            is_zero = (sim_count == 0)
+        else:
+            # No "Total SIMs N" parsed - fallback heuristics
+            has_no_sims_text = (
+                "No SIMs" in body_text
+                or "no sims" in body_text.lower()
+                or "Add SIM" in body_text
+                or "add sim" in body_text.lower()
+            )
+            if card_count == 0 and phone_count == 0 and has_no_sims_text:
+                is_zero = True
+        # Extra safety: explicit substring check
+        if not is_zero and "Total SIMs 0" in body_text:
+            is_zero = True
+
+        if is_zero:
+            msg = f"No SIMs registered for {self.current_sim or 'unknown'} - check dashboard"
+            log(msg, "error")
+            try:
+                self.log.error(msg, details={"sim": self.current_sim, "sim_count": sim_count, "card_count": card_count, "phone_count": phone_count, "url": cfg.SIMS_PAGE_URL})
+            except Exception:
+                pass
+            raise NoSimsRegistered(msg)
+
+        # SIMs present
+        display_count = sim_count if sim_count is not None else (card_count or phone_count or 1)
+        # If sim_count is None but we have evidence of SIMs, ensure we log at least 1
+        if sim_count is None and card_count == 0 and phone_count == 0:
+            # No explicit count but not zero - could be parsing failure; treat as unknown but >0
+            display_count = "?"
+            log(f"SIM check: sims present (could not parse count, card_count={card_count} phone_count={phone_count})", "ok")
+        else:
+            log(f"SIM check: {display_count} sims found", "ok")
+
+        # Navigate back to test-numbers page so next tick can continue testing flow
+        try:
+            self.driver.get(cfg.TEST_NUMBERS_PAGE_URL)
+        except Exception as e:
+            log(f"scout_dashboard: failed to navigate back to {cfg.TEST_NUMBERS_PAGE_URL}: {e}", "warn")
         return True
 
     def do_test_numbers_available(self):
@@ -1674,6 +1771,14 @@ def run():
         except KeyboardInterrupt:
             log("Interrupted by user", "warn")
             bot.running = False
+        except NoSimsRegistered as e:
+            # Custom exception: 0 SIMs on dashboard - server will pick up and notify
+            log(f"NoSimsRegistered: {e}", "error")
+            try:
+                bot.log.error(f"NoSimsRegistered: {e}", details={"sim": getattr(bot, "current_sim", None), "url": getattr(bot.driver, "current_url", "")})
+            except Exception:
+                pass
+            raise SystemExit(str(e))
         except SystemExit as e:
             log(f"Exit: {e}", "warn")
             break
