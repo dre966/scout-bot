@@ -1753,9 +1753,16 @@ def run():
     if driver is None:
         return
 
-    # Switch to target tab (best-effort)
+    # On google homepage / newtab, redirect to scoutandrunner.com after 5s when ready
     try:
-        switch_to_target_tab(driver, getattr(cfg, "TARGET_URL_SUBSTRING", getattr(cfg, "SITE_DOMAIN", "")))
+        current = driver.current_url or ""
+        if "google.com" in current or "chrome://newtab" in current or current in ("about:blank", "data:,"):
+            log(f"On {current or 'newtab/google'} - waiting 5s then navigating to {cfg.BASE_URL}", "info")
+            time.sleep(5)
+            driver.get(cfg.BASE_URL)
+            time.sleep(2)
+        else:
+            switch_to_target_tab(driver, getattr(cfg, "TARGET_URL_SUBSTRING", getattr(cfg, "SITE_DOMAIN", "")))
     except Exception:
         pass
 
