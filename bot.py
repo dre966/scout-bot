@@ -1540,7 +1540,20 @@ class SiteBot:
         return True
 
     def do_nothing_to_scout(self):
-        log("STATE: nothing_to_scout", "warn")
+        log("STATE: nothing_to_scout - no numbers to test", "warn")
+        # high-priority notify like NoSimsRegistered so dashboard banners
+        try:
+            _post_to_server("notify.php", {
+                "bot_id": BOT_ID,
+                "type": "NoNumbersToTest",
+                "message": f"No numbers to test (nothing_to_scout) on {self.proxy_email}",
+                "details": {"proxy": getattr(self, "proxy_email", None), "url": self.driver.current_url if hasattr(self.driver, "current_url") else ""},
+                "priority": "high"
+            })
+        except Exception:
+            pass
+        # avoid spam: sleep a bit before next tick re-notifies
+        time.sleep(5)
         return True
 
     def do_confirm_session(self):
@@ -2636,9 +2649,25 @@ class SiteBot:
         return True
 
     def do_unknown(self):
-        log("STATE: unknown - no handler", "error")
+        # Session Expired is rendered outside container (portal/toast) so identify_state misses it -> recover to landing
         try:
             body = self.get_body_text()
+            low = (body or "").lower()
+            if "session expired" in low or ("your session has expired" in low) or ("log in again" in low and "connect wallet" in low):
+                log("unknown: Session Expired detected -> navigating to landing", "warn")
+                try:
+                    self.driver.get(cfg.BASE_URL)
+                    time.sleep(2)
+                except Exception as e:
+                    log(f"Session Expired recovery get failed: {e}", "warn")
+                    try:
+                        self.driver.delete_all_cookies()
+                        self.driver.execute_script("try{localStorage.clear()}catch(e){}; try{sessionStorage.clear()}catch(e){}")
+                        self.driver.get(cfg.BASE_URL)
+                        time.sleep(2)
+                    except Exception:
+                        pass
+                return True
             preview = body[:200].replace("\n", " ") if body else ""
             log(f"unknown page preview: '{preview}...'", "error")
         except Exception:
