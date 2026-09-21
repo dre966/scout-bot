@@ -1392,17 +1392,27 @@ class SiteBot:
         return True
 
     def do_resume_test(self):
-        log("STATE: resume_test", "info")
+        log("STATE: resume_test - Finish your current test first", "info")
         btn = self.find_button_with_text(cfg.TRIGGERS["resume_test_button"])
+        if btn is None:
+            log("resume_test: primary button not found, trying fallback 'Resume'", "warn")
+            btn = self.find_button_with_text("Resume")
         if btn is not None:
-            self.click(btn, label=cfg.TRIGGERS["resume_test_button"])
-            time.sleep(1)
-        else:
-            log("resume_test: Resume test button not found", "warn")
-            # fallback: try generic text "Resume"
-            btn2 = self.find_button_with_text("Resume")
-            if btn2 is not None:
-                self.click(btn2, label="Resume")
+            log(f"resume_test: clicking '{btn.text[:40]}'", "info")
+            clicked = self.click(btn, label=cfg.TRIGGERS["resume_test_button"])
+            log(f"resume_test: click result={clicked}", "info")
+            time.sleep(1.5)
+            return True
+        log("resume_test: Resume test button not found", "warn")
+        # fallback: try via JS click on any button containing Resume
+        try:
+            js = "var b=document.querySelectorAll('button');for(var i=0;i<b.length;i++){if(b[i].textContent.includes('Resume')){b[i].click();return true;}}return false;"
+            if self.driver.execute_script(js):
+                log("resume_test: JS fallback click succeeded", "ok")
+                time.sleep(1.5)
+                return True
+        except Exception as e:
+            log(f"resume_test JS fallback failed: {e}", "warn")
         return True
 
     def do_verification_ended(self):
@@ -1532,24 +1542,61 @@ class SiteBot:
         except Exception:
             pass
         try:
-            inputs = self.driver.find_elements(By.CSS_SELECTOR, "input[type='number']")
-            inp = inputs[0] if inputs else None
+            # robust input search: number first, then text that looks like balance input, then any input
+            inp = None
+            for sel in ["input[type='number']", "input[type='text']", "input"]:
+                try:
+                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                    if els:
+                        # prefer visible enabled input
+                        for el in els:
+                            try:
+                                if el.is_displayed() and el.is_enabled():
+                                    inp = el
+                                    break
+                            except Exception:
+                                inp = el
+                                break
+                        if inp is not None:
+                            log(f"balance_entry: found input via {sel}", "info")
+                            break
+                except Exception:
+                    continue
             if inp is not None:
-                self.type_into(inp, cfg.BALANCE_INPUT_VALUE, label="balance amount")
+                ok = self.type_into(inp, cfg.BALANCE_INPUT_VALUE, label="balance amount")
+                log(f"balance_entry: type_into result={ok} value={cfg.BALANCE_INPUT_VALUE}", "info")
                 time.sleep(1.0)
             else:
-                log("balance_entry: number input not found", "warn")
+                log("balance_entry: no input found, will try Continue directly", "warn")
+            # always try to click Continue even if input not found
             btn = self.find_button_with_text(cfg.TRIGGERS["continue_button"])
-            if btn is not None and btn.get_attribute("disabled"):
-                log("balance_entry: Continue still disabled", "warn")
-                return True
+            if btn is None:
+                btn = self.find_button_with_text("Continue")
             if btn is not None:
-                self.click(btn, label=cfg.TRIGGERS["continue_button"], testing_mode=True)
-            else:
-                btn2 = self.find_button_with_text("Continue")
-                if btn2 is not None:
-                    self.click(btn2, label="Continue", testing_mode=True)
-            return True
+                # if disabled, wait briefly for enable after typing
+                try:
+                    if btn.get_attribute("disabled"):
+                        log("balance_entry: Continue disabled after typing, waiting 1s...", "warn")
+                        time.sleep(1.0)
+                        # re-find in case DOM updated
+                        btn2 = self.find_button_with_text(cfg.TRIGGERS["continue_button"]) or self.find_button_with_text("Continue")
+                        if btn2 is not None:
+                            btn = btn2
+                except Exception:
+                    pass
+                clicked = self.click(btn, label=cfg.TRIGGERS["continue_button"], testing_mode=True)
+                log(f"balance_entry: click Continue result={clicked}", "info")
+                time.sleep(0.8)
+                if not clicked:
+                    try:
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        log("balance_entry: JS fallback click sent", "info")
+                        time.sleep(0.8)
+                    except Exception as e:
+                        log(f"balance_entry JS click failed: {e}", "warn")
+                return True
+            log("balance_entry: Continue button not found", "warn")
+            return False
         except Exception as e:
             log(f"balance_entry failed: {e}", "warn")
             return False
@@ -1579,48 +1626,15 @@ class SiteBot:
             self.show_progress()
         except Exception:
             pass
-        # Never allow banned dispositions
-        BANNED = getattr(cfg, "BANNED_DISPOSITIONS", ["A human answered", "I heard voice mail"])
-        # Choose disposition: reuse session_disposition if already set and not banned, else fixed IVR incorrect
-        if self.session_disposition is not None and self.session_disposition not in BANNED:
-            label = self.session_disposition
-        else:
-            # Check saved disposition for current call if reuse enabled
-            saved = None
-            try:
-                if getattr(cfg, "REUSE_NUMBERS", False) and self.noted_phone_number:
-                    # call num fallback to call_count or 1
-                    cn = self.call_count if self.call_count else 1
-                    saved = self.get_saved_disposition(self.noted_phone_number, cn)
-            except Exception:
-                saved = None
-            if saved and saved not in BANNED:
-                label = saved
-                self.session_disposition = saved
-            else:
-                # Always prefer the safe incorrect IVR option
-                label = "I heard an IVR, but it was incorrect"
-                # Ensure it's in allowed options; if not, pick first non-banned from SELECT_ONE_OPTIONS
-                options = [o for o in getattr(cfg, "SELECT_ONE_OPTIONS", [label]) if o not in BANNED]
-                if label not in options and options:
-                    label = options[0]
-                self.session_disposition = label
-
-        if label in getattr(cfg, "NEGATIVE_OPTIONS", []):
-            self.session_disposition_category = "negative"
-
+        # simplified: always pick safe incorrect IVR (no reuse, no random)
+        label = "I heard an IVR, but it was incorrect"
+        self.session_disposition = label
+        self.session_disposition_category = "negative"
         log(f"Disposition chosen: {label}", "info")
         try:
             self.log.disposition_chosen(label)
         except Exception:
             pass
-        # record for reuse
-        try:
-            cn = self.call_count if self.call_count else 1
-            self.record_disposition(self.noted_phone_number, cn, label)
-        except Exception:
-            pass
-
         # Click via JS exact text match to avoid stale issues
         try:
             label_escaped = label.replace("\\", "\\\\").replace("'", "\\'")
@@ -1648,7 +1662,6 @@ class SiteBot:
             return False
         except Exception as e:
             log(f"select_one failed: {e}", "warn")
-            # last fallback
             try:
                 btn = self.find_button_with_text(label)
                 if btn is not None:
@@ -1742,57 +1755,27 @@ class SiteBot:
                     self.noted_phone_number = phone
         except Exception:
             pass
-        # Check saved disposition for call 1 if reuse enabled
-        try:
-            if getattr(cfg, "REUSE_NUMBERS", False) and self.noted_phone_number:
-                saved = self.get_saved_disposition(self.noted_phone_number, 1)
-                if saved:
-                    self.session_disposition = saved
-                    log(f"[reuse] Saved disposition for call 1: {saved}", "info")
-                    try:
-                        self.log.disposition_chosen(saved)
-                    except Exception:
-                        pass
-                    if saved == "The call did not connect":
-                        btn = self.find_button_with_text("The call did not connect")
-                        if btn is not None:
-                            self.click(btn, label="The call did not connect", testing_mode=True)
-                            return True
-                    btn = self.find_button_with_text(cfg.TRIGGERS["heard_ivr_button"])
-                    if btn is not None:
-                        self.click(btn, label=cfg.TRIGGERS["heard_ivr_button"], testing_mode=True)
-                        return True
-        except Exception as e:
-            log(f"call_this_number reuse check failed: {e}", "warn")
-        # Random no-connect chance
+        # 15% chance of "The call did not connect" (only here, not on continue_verification)
         try:
             if random.random() < getattr(cfg, "NO_CONNECT_CHANCE", 0.15):
                 btn = self.find_button_with_text("The call did not connect")
                 if btn is not None:
-                    log("The call did not connect (random)", "info")
+                    log("The call did not connect (random 15%)", "info")
                     self.session_disposition = "The call did not connect"
                     try:
                         self.log.disposition_chosen(self.session_disposition)
-                    except Exception:
-                        pass
-                    try:
-                        self.record_disposition(self.noted_phone_number, 1, self.session_disposition)
                     except Exception:
                         pass
                     self.click(btn, label="The call did not connect", testing_mode=True)
                     return True
         except Exception:
             pass
-        # Default: I heard audio
+        # Default: always click "I heard audio" (no saved disposition logic)
         try:
             btn = self.find_button_with_text(cfg.TRIGGERS["heard_ivr_button"])
             if btn is None:
                 btn = self.find_button_with_text("I heard audio")
             if btn is not None:
-                # if we haven't set disposition yet, set default for next step
-                if not self.session_disposition or self.session_disposition == "The call did not connect":
-                    # keep as None so select_one will pick IVR incorrect
-                    pass
                 self.click(btn, label=cfg.TRIGGERS["heard_ivr_button"], testing_mode=True)
                 return True
             log("call_this_number: I heard audio button not found", "warn")
@@ -1822,7 +1805,7 @@ class SiteBot:
                     self.noted_phone_number = phone
         except Exception:
             pass
-        # Call 5 -> Cancel attempt (ban evasion)
+        # Call 5 -> Cancel attempt (ban evasion) - keep this
         if self.call_count == 5:
             log("Call 5 - cancelling attempt (ban evasion)", "warn")
             try:
@@ -1832,7 +1815,6 @@ class SiteBot:
                 if btn is not None:
                     self.click(btn, label="Cancel attempt", testing_mode=True)
                     time.sleep(1)
-                    # Fill reason textarea in modal
                     try:
                         textareas = self.driver.find_elements(By.TAG_NAME, "textarea")
                         ta = textareas[0] if textareas else None
@@ -1841,13 +1823,11 @@ class SiteBot:
                             time.sleep(0.5)
                     except Exception as e:
                         log(f"continue_verification cancel textarea failed: {e}", "warn")
-                    # Click Cancel test button in modal
                     cancel_btn = self.find_button_with_text("Cancel test")
                     if cancel_btn is not None:
                         self.click(cancel_btn, label="Cancel test", testing_mode=True)
                         log("Attempt cancelled on call 5", "warn")
                     else:
-                        # fallback text
                         cancel_btn2 = self.find_button_with_text("Cancel")
                         if cancel_btn2 is not None:
                             self.click(cancel_btn2, label="Cancel")
@@ -1859,40 +1839,15 @@ class SiteBot:
             except Exception as e:
                 log(f"continue_verification cancel failed: {e}", "warn")
                 return False
-        # For calls 2-4: reuse or set disposition
-        # Check saved disposition first
-        try:
-            if getattr(cfg, "REUSE_NUMBERS", False) and self.noted_phone_number:
-                saved = self.get_saved_disposition(self.noted_phone_number, self.call_count if self.call_count else 2)
-                if saved:
-                    self.session_disposition = saved
-                    log(f"[reuse] Using saved disposition for call {self.call_count}: {saved}", "info")
-                    try:
-                        self.log.disposition_chosen(saved)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        # If disposition is "The call did not connect", click that button
-        if self.session_disposition == "The call did not connect":
-            try:
-                btn = self.find_button_with_text("The call did not connect")
-                if btn is not None:
-                    self.click(btn, label="The call did not connect", testing_mode=True)
-                    return True
-            except Exception:
-                pass
-        # Otherwise ensure we have a safe disposition for next select_one
-        if not self.session_disposition or self.session_disposition in getattr(cfg, "BANNED_DISPOSITIONS", []):
-            # keep session_disposition as incorrect IVR for consistency across calls 2-4
-            if not self.session_disposition:
-                self.session_disposition = "I heard an IVR, but it was incorrect"
-        # Click I heard audio
+        # For calls 2-4: always click "I heard audio" (simplified, no reuse, no disposition branching)
         try:
             btn = self.find_button_with_text(cfg.TRIGGERS["heard_ivr_button"])
             if btn is None:
                 btn = self.find_button_with_text("I heard audio")
             if btn is not None:
+                # keep a safe disposition for subsequent select_one
+                if not self.session_disposition:
+                    self.session_disposition = "I heard an IVR, but it was incorrect"
                 self.click(btn, label=cfg.TRIGGERS["heard_ivr_button"], testing_mode=True)
                 return True
             log("continue_verification: I heard audio button not found", "warn")
@@ -1907,11 +1862,11 @@ class SiteBot:
             self.show_progress()
         except Exception:
             pass
-        # Voicemail check - if page contains voicemail, go back and retry
+        # Simple voicemail check: go back
         try:
             body_text = (self.get_body_text() or "").lower()
             if "voicemail" in body_text or "voice mail" in body_text:
-                log("Voicemail detected on result page - going back to retry", "warn")
+                log("Voicemail detected on result page - going back", "warn")
                 btn = self.find_button_with_text("Back")
                 if btn is not None:
                     self.click(btn, label="Back", testing_mode=True)
@@ -1925,63 +1880,48 @@ class SiteBot:
                 return True
         except Exception:
             pass
-        # Type balance
+        # Type 60 into balance input (robust search)
         try:
-            inputs = self.driver.find_elements(By.CSS_SELECTOR, "input[type='number']")
-            inp = inputs[0] if inputs else None
+            inp = None
+            for sel in ["input[type='number']", "input[type='text']", "input"]:
+                try:
+                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                    if els:
+                        for el in els:
+                            try:
+                                if el.is_displayed() and el.is_enabled():
+                                    inp = el
+                                    break
+                            except Exception:
+                                inp = el
+                                break
+                        if inp is not None:
+                            break
+                except Exception:
+                    continue
             if inp is not None:
                 self.type_into(inp, cfg.BALANCE_INPUT_VALUE, label="remaining balance")
+                log(f"call_result: typed {cfg.BALANCE_INPUT_VALUE}", "info")
                 time.sleep(1.0)
             else:
-                log("call_result: number input not found", "warn")
+                log("call_result: number input not found, trying submit directly", "warn")
         except Exception as e:
             log(f"call_result balance input failed: {e}", "warn")
-        # Add notes with NOTES_CHANCE
+        # Submit (no notes complexity - just submit)
         try:
-            if random.random() < getattr(cfg, "NOTES_CHANCE", 0.8):
-                note = None
-                # Prefer disposition-matched notes
-                if self.session_disposition:
-                    pool_by_disp = getattr(cfg, "NOTES_BY_DISPOSITION", {}).get(self.session_disposition)
-                    if pool_by_disp:
-                        note = random.choice(pool_by_disp)
-                if note is None:
-                    pool = getattr(cfg, "NOTES_POOL", ["audio was clear"])
-                    note = random.choice(pool)
-                textareas = self.driver.find_elements(By.TAG_NAME, "textarea")
-                if textareas:
-                    self.type_into(textareas[0], note, label="notes")
-                    log(f"Notes: {note}", "info")
-                    time.sleep(0.5)
-        except Exception as e:
-            log(f"call_result notes failed: {e}", "warn")
-        # Submit
-        try:
-            btn = None
-            # Try to find submit within same form as textarea first
-            try:
-                textareas = self.driver.find_elements(By.TAG_NAME, "textarea")
-                if textareas:
-                    form = textareas[0].find_element(By.XPATH, "./ancestor::div[contains(@class,'flex') and contains(@class,'flex-col')]")
-                    for b in form.find_elements(By.TAG_NAME, "button"):
-                        try:
-                            if _text_matches(b.text, cfg.TRIGGERS["submit_button"]):
-                                btn = b
-                                break
-                        except StaleElementReferenceException:
-                            continue
-            except Exception:
-                pass
-            if btn is None:
-                btn = self.find_button_with_text(cfg.TRIGGERS["submit_button"])
+            btn = self.find_button_with_text(cfg.TRIGGERS["submit_button"])
             if btn is None:
                 btn = self.find_button_with_text("Submit")
-            if btn is not None and btn.get_attribute("disabled"):
-                log("call_result: Submit still disabled after typing", "warn")
-                return True
             if btn is not None:
+                try:
+                    if btn.get_attribute("disabled"):
+                        log("call_result: Submit disabled, waiting 1s...", "warn")
+                        time.sleep(1.0)
+                except Exception:
+                    pass
                 log(f"Submitting: {btn.text.strip()[:30]}", "info")
                 self.click(btn, label=cfg.TRIGGERS["submit_button"], testing_mode=True)
+                time.sleep(0.8)
                 return True
             log("call_result: Submit button not found", "warn")
             return False
