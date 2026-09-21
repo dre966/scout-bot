@@ -41,8 +41,6 @@ ENV DISPLAY=:99
 ENV PYTHONUNBUFFERED=1
 ENV CHROME_FLAGS="--remote-debugging-port=9222 --no-sandbox --disable-gpu --window-size=1920,1080"
 
-VOLUME ["/app/data", "/app/logs"]
-
 EXPOSE 9222 5900 6080
 
 COPY start.sh /app/start.sh
