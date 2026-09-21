@@ -898,7 +898,18 @@ class SiteBot:
             if not on_cooldown and cycle < 8:
                 available_sims.append(sim)
         if not available_sims:
-            log("No SIMs with available slots", "warn")
+            log("No SIMs with available slots (all 8/8 or cooldown) — emitting NoNumbersToTest high", "warn")
+            try:
+                _post_to_server("notify.php", {
+                    "bot_id": BOT_ID,
+                    "type": "NoNumbersToTest",
+                    "message": f"No SIM slots available (all {len(sims_raw)} SIM(s) at 8/8 or cooldown) on {self.proxy_email}",
+                    "details": {"proxy": self.proxy_email, "sims_raw": sims_raw[:3]},
+                    "priority": "high"
+                })
+            except Exception:
+                pass
+            time.sleep(5)
             return False
         if getattr(self, "current_sim_id", None):
             sim = None
