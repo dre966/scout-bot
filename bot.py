@@ -1363,7 +1363,17 @@ class SiteBot:
         return True
 
     def do_resume_test(self):
-        log("STATE: resume_test")
+        log("STATE: resume_test", "info")
+        btn = self.find_button_with_text(cfg.TRIGGERS["resume_test_button"])
+        if btn is not None:
+            self.click(btn, label=cfg.TRIGGERS["resume_test_button"])
+            time.sleep(1)
+        else:
+            log("resume_test: Resume test button not found", "warn")
+            # fallback: try generic text "Resume"
+            btn2 = self.find_button_with_text("Resume")
+            if btn2 is not None:
+                self.click(btn2, label="Resume")
         return True
 
     def do_verification_ended(self):
