@@ -897,6 +897,23 @@ class SiteBot:
             log(f"[sim] {phone} cycle={cycle}/8 status={status} cooldown={'YES' if on_cooldown else 'no'}", "info")
             if not on_cooldown and cycle < 8:
                 available_sims.append(sim)
+        # report full sims detail to server for dashboard Call Status (max vs current 1/8, 2/8)
+        try:
+            detail = []
+            for s in sims_raw:
+                sim_obj = s.get("sim", s) if isinstance(s, dict) and "sim" in s else s
+                detail.append({
+                    "id": sim_obj.get("id"),
+                    "phone": sim_obj.get("phoneNumber", "?"),
+                    "cycle": int(sim_obj.get("testsInCycle", 0) or 0),
+                    "status": sim_obj.get("status", "?"),
+                    "cooldownEndsAt": sim_obj.get("cooldownEndsAt"),
+                    "isMax": int(sim_obj.get("testsInCycle", 0) or 0) >= 8,
+                    "isCurrent": sim_obj.get("id") == getattr(self, "current_sim_id", None)
+                })
+            _post_to_server("sims_status.php", {"bot_id": BOT_ID, "sims": detail, "proxy_email": self.proxy_email})
+        except Exception as e:
+            log(f"sims_status post failed: {e}", "warn")
         if not available_sims:
             log("No SIMs with available slots (all 8/8 or cooldown) — emitting NoNumbersToTest high", "warn")
             try:
@@ -2445,6 +2462,11 @@ class SiteBot:
         else:
             log(f"SIM check: {display_count} sims found", "ok")
 
+        # also report dashboard SIM count for Call Status fallback (when API pairing not used)
+        try:
+            _post_to_server("sims_status.php", {"bot_id": BOT_ID, "sims": [{"id": None, "phone": "dashboard_count", "cycle": 0, "status": f"total:{display_count}", "isMax": False, "isCurrent": False}], "proxy_email": self.proxy_email, "dashboard_count": display_count})
+        except Exception:
+            pass
         # Navigate back to test-numbers page so next tick can continue testing flow
         try:
             self.driver.get(cfg.TEST_NUMBERS_PAGE_URL)
