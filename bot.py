@@ -1822,18 +1822,23 @@ def run():
     if driver is None:
         return
 
-    # On google homepage / newtab, redirect to scoutandrunner.com after 5s when ready
+    # Auto-load: if not already on scoutandrunner.com, navigate there after 5s when ready
     try:
-        current = driver.current_url or ""
-        if "google.com" in current or "chrome://newtab" in current or current in ("about:blank", "data:,"):
-            log(f"On {current or 'newtab/google'} - waiting 5s then navigating to {cfg.BASE_URL}", "info")
+        current = (driver.current_url or "").strip()
+        if "scoutandrunner.com" not in current:
+            log(f"On {current or 'newtab/blank'} - waiting 5s then navigating to {cfg.BASE_URL}", "info")
             time.sleep(5)
             driver.get(cfg.BASE_URL)
-            time.sleep(2)
+            time.sleep(3)
         else:
             switch_to_target_tab(driver, getattr(cfg, "TARGET_URL_SUBSTRING", getattr(cfg, "SITE_DOMAIN", "")))
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Auto-load failed: {e} - trying direct get", "warn")
+        try:
+            driver.get(cfg.BASE_URL)
+            time.sleep(3)
+        except Exception:
+            pass
 
     bot = SiteBot(driver)
     # compat: expose running flag if needed
