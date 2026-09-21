@@ -644,6 +644,301 @@ class SiteBot:
             return []
         return panel.find_elements(By.TAG_NAME, "button")
 
+    def _switch_to_scout(self):
+        try:
+            self.driver.get(cfg.TEST_NUMBERS_PAGE_URL)
+        except Exception:
+            try:
+                fallback = getattr(cfg, "SCOUT_DASHBOARD_URL", None) or (cfg.BASE_URL + "/scout")
+                self.driver.get(fallback)
+            except Exception as e:
+                log(f"_switch_to_scout failed: {e}", "warn")
+
+    # -- disposition history helpers (restored from smart_call_yours.py) ----
+
+    def _history_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "tested_numbers.json")
+
+    def load_disposition_history(self):
+        path = self._history_path()
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def save_disposition_history(self, history):
+        try:
+            with open(self._history_path(), "w") as f:
+                json.dump(history, f, indent=2)
+        except Exception as e:
+            log(f"save_disposition_history failed: {e}", "warn")
+
+    def get_saved_disposition(self, phone, call_num):
+        if not getattr(cfg, "REUSE_NUMBERS", False) or not phone:
+            return None
+        history = self.load_disposition_history()
+        disps = history.get(phone)
+        if disps and call_num <= len(disps):
+            return disps[call_num - 1]
+        return None
+
+    def record_disposition(self, phone, call_num, disposition):
+        if not getattr(cfg, "REUSE_NUMBERS", False):
+            return
+        if not phone:
+            phone = self.noted_phone_number
+        if not phone or not disposition:
+            return
+        history = self.load_disposition_history()
+        existing = history.get(phone, [])
+        while len(existing) < call_num:
+            existing.append(None)
+        existing[call_num - 1] = disposition
+        history[phone] = existing
+        self.save_disposition_history(history)
+
+    def _get_bearer_token(self):
+        if getattr(self, "api_token", None):
+            return self.api_token
+        token = _extract_auth_token(self.driver)
+        if token:
+            self.api_token = token
+            return token
+        return None
+
+    def _get_current_range_id(self):
+        js = """
+        const entries = performance.getEntriesByType('resource');
+        let sessionId = null;
+        for (let i = entries.length - 1; i >= 0; i--) {
+            const m = entries[i].name.match(/\/scout\/sessions\/([a-f0-9-]+)/);
+            if (m) { sessionId = m[1]; break; }
+        }
+        if (!sessionId) return null;
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', '/api/scout/sessions/' + sessionId, false);
+        xhr.send();
+        if (xhr.status === 200) {
+            const d = JSON.parse(xhr.responseText);
+            return d.rangeId || (d.session && d.session.rangeId) || null;
+        }
+        return null;
+        """
+        try:
+            return self.driver.execute_script(js)
+        except Exception:
+            return None
+
+    def api_pair_session(self):
+        log("API PAIRING", "info")
+        token = self._get_bearer_token()
+        if not token:
+            log("No bearer token found in localStorage", "warn")
+            return False
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Origin": "https://scoutandrunner.com",
+            "Referer": "https://scoutandrunner.com/scout/test-numbers",
+        }
+        try:
+            resp = requests.get("https://scoutandrunner.com/api/scout/sims", headers=headers, timeout=15)
+            if resp.status_code != 200:
+                log(f"Failed to fetch SIMs: {resp.status_code}", "warn")
+                return False
+            data = resp.json()
+            sims_raw = data if isinstance(data, list) else data.get("sims", data.get("data", []))
+        except Exception as e:
+            log(f"Error fetching SIMs: {e}", "warn")
+            return False
+        available_sims = []
+        for s in sims_raw:
+            if isinstance(s, dict) and "sim" in s:
+                sim = dict(s["sim"])
+                if "packages" in s:
+                    sim["packages"] = s["packages"]
+                if "package" in s:
+                    sim["package"] = s["package"]
+            else:
+                sim = s
+            phone = sim.get("phoneNumber", "?")
+            cycle = sim.get("testsInCycle", 0)
+            cooldown = sim.get("cooldownEndsAt", "")
+            status = sim.get("status", "?")
+            on_cooldown = False
+            if cooldown:
+                try:
+                    from datetime import timezone
+                    cd_end = datetime.fromisoformat(cooldown.replace("Z", "+00:00"))
+                    if cd_end < datetime.now(timezone.utc):
+                        on_cooldown = True
+                except Exception:
+                    pass
+            log(f"[sim] {phone} cycle={cycle}/8 status={status} cooldown={'YES' if on_cooldown else 'no'}", "info")
+            if not on_cooldown and cycle < 8:
+                available_sims.append(sim)
+        if not available_sims:
+            log("No SIMs with available slots", "warn")
+            return False
+        if getattr(self, "current_sim_id", None):
+            sim = None
+            for s in available_sims:
+                if s.get("id") == self.current_sim_id:
+                    sim = s
+                    break
+            if sim:
+                log(f"[sim] Reusing {sim.get('phoneNumber', '?')}", "info")
+            else:
+                sim = available_sims[0]
+                self.current_sim_id = sim.get("id")
+                log(f"[sim] Switching to {sim.get('phoneNumber', '?')} (old one finished)", "info")
+        else:
+            sim = available_sims[0]
+            self.current_sim_id = sim.get("id")
+            log(f"[sim] Selected {sim.get('phoneNumber', '?')} ({sim.get('testsInCycle', 0)}/8)", "info")
+        sim_id = sim.get("id")
+        packages = sim.get("packages", [])
+        pkg = packages[0] if packages else sim.get("package", {})
+        package_id = pkg.get("id") if isinstance(pkg, dict) else None
+        if not sim_id or not package_id:
+            log(f"Missing simId or packageId (sim={sim_id}, pkg={package_id})", "warn")
+            return False
+        candidates = getattr(cfg, "API_CANDIDATES", [])
+        if not candidates:
+            log("No API_CANDIDATES configured", "warn")
+            return False
+        allowed = [c.upper() for c in getattr(cfg, "ALLOWED_COUNTRIES", [])]
+        pool = [c for c in candidates if not allowed or c["country"].upper() in allowed]
+        if not pool:
+            pool = candidates
+        pool = [c for c in pool if c["phone"] not in self.tested_numbers]
+        if not pool:
+            self.tested_numbers.clear()
+            pool = candidates
+        cand = random.choice(pool)
+        payload = {"simId": sim_id, "numberId": cand["id"], "packageId": package_id}
+        try:
+            resp = requests.post("https://scoutandrunner.com/api/scout/sessions", json=payload, headers=headers, timeout=10)
+            if resp.status_code in (200, 201):
+                log(f"Session created! SIM: {sim.get('phoneNumber', sim_id[:8])} | Number: {cand['phone']} [{cand['country']}]", "ok")
+                self.tested_numbers.add(cand["phone"])
+                self.noted_phone_number = cand["phone"]
+                self.driver.refresh()
+                time.sleep(2)
+                return True
+            elif resp.status_code == 409:
+                log("Session already exists for this pair — trying another", "warn")
+                return False
+            else:
+                log(f"POST failed: {resp.status_code} {resp.text[:200]}", "warn")
+                return False
+        except Exception as e:
+            log(f"Error creating session: {e}", "warn")
+            return False
+
+    def step_click_test_number(self, rows=None, retry_count=0, max_retries=10):
+        if retry_count == 0:
+            log("SELECTING TEST NUMBER", "info")
+            self.test_start_time = time.time()
+        if retry_count >= max_retries:
+            log(f"Failed after {max_retries} attempts", "warn")
+            return
+        if rows is None:
+            rows = self.find_test_number_rows()
+        if not rows:
+            log("no 'Test Number' rows found", "warn")
+            return
+        skip_country = getattr(cfg, "SKIP_COUNTRY_FILTER", False)
+        if cfg.ALLOWED_COUNTRIES and not skip_country:
+            allowed_lower = [c.upper() for c in cfg.ALLOWED_COUNTRIES]
+            filtered = [(b, n, cc) for b, n, cc in rows if cc.upper() in allowed_lower]
+            if not filtered:
+                log(f"no rows from allowed countries: {cfg.ALLOWED_COUNTRIES}", "warn")
+                return
+            rows = filtered
+        if cfg.MAX_NUMBER_LENGTH:
+            before = len(rows)
+            filtered = []
+            for b, n, cc in rows:
+                digits = re.sub(r'\D', '', n)
+                cc_digits = {"NL": "31", "IT": "39", "FR": "33", "ES": "34", "BE": "32", "SI": "386", "GB": "44", "SN": "221", "BI": "257", "JO": "962", "CD": "243", "SL": "232", "BO": "591", "HR": "385", "AT": "43", "MX": "52", "BR": "55", "DK": "45"}
+                cc_prefix = cc_digits.get(cc.upper(), "")
+                if digits.startswith(cc_prefix):
+                    local = digits[len(cc_prefix):]
+                else:
+                    local = digits
+                num_len = len(local)
+                max_len = cfg.MAX_NUMBER_LENGTH.get(cc.upper(), 9)
+                skip_len = getattr(cfg, "SKIP_LENGTH_FILTER", False)
+                if skip_len:
+                    passed_len = True
+                else:
+                    passed_len = num_len <= max_len
+                skip_prefix = getattr(cfg, "SKIP_PREFIX_FILTER", False)
+                if skip_prefix:
+                    has_valid_prefix = True
+                else:
+                    valid_prefixes = cfg.MOBILE_PREFIXES.get(cc.upper(), [])
+                    has_valid_prefix = any(local.startswith(p) for p in valid_prefixes) if valid_prefixes else True
+                passed = passed_len and has_valid_prefix
+                if passed:
+                    filtered.append((b, n, cc))
+            if not filtered:
+                log(f"ALL {before} numbers excluded - no valid numbers available", "warn")
+                return
+            rows = filtered
+        if not rows:
+            log("no valid numbers available", "warn")
+            return
+        if cfg.AVOID_REPEAT_NUMBERS:
+            available = [(b, n, cc) for b, n, cc in rows if n not in self.tested_numbers]
+            if not available:
+                self.tested_numbers.clear()
+                available = rows
+        else:
+            available = rows
+        if not available:
+            log("no valid numbers available after filtering", "warn")
+            return
+        if cfg.NUMBER_SELECTION_STRATEGY == "random":
+            btn, number, country = random.choice(available)
+        elif cfg.NUMBER_SELECTION_STRATEGY == "last":
+            btn, number, country = available[-1]
+        else:
+            btn, number, country = available[0]
+        if number:
+            self.tested_numbers.add(number)
+        try:
+            time.sleep(fixed_delay())
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            btn.click()
+            self.stale_error_count = 0
+            self.saved_dispositions = None
+            if number:
+                self.noted_phone_number = number
+            if getattr(cfg, "REUSE_NUMBERS", False) and number:
+                history = self.load_disposition_history()
+                if number in history:
+                    self.saved_dispositions = history[number]
+                    log(f"[reuse] Loaded {len(self.saved_dispositions)} saved dispositions for {number}", "info")
+                else:
+                    log(f"[new] No saved dispositions for {number}", "info")
+            log(f"Clicked Test Number: {number or 'unknown'} [{country}]", "ok")
+        except StaleElementReferenceException:
+            log(f"Stale element ({retry_count + 1}/{max_retries}) - retrying", "warn")
+            self.tested_numbers.discard(number)
+            time.sleep(0.5)
+            self.driver.refresh()
+            time.sleep(fixed_delay() * 2)
+            self.step_click_test_number(None, retry_count + 1, max_retries)
+        except Exception as e:
+            log(f"Click failed: {e}", "warn")
+
     # -- auth helpers ------------------------------------------------------
 
     def _find_element(self, by, value, timeout=3):
@@ -1076,7 +1371,22 @@ class SiteBot:
         return False
 
     def do_test_numbers_list(self):
-        log("STATE: test_numbers_list", "ok")
+        log("STATE: test_numbers_list", "info")
+        if getattr(cfg, "API_PAIRING", False):
+            try:
+                self.api_pair_session()
+            except Exception as e:
+                log(f"api_pair_session failed: {e}", "warn")
+                try:
+                    self.step_click_test_number(self.find_test_number_rows())
+                except Exception as e2:
+                    log(f"step_click fallback failed: {e2}", "warn")
+        else:
+            try:
+                rows = self.find_test_number_rows()
+                self.step_click_test_number(rows)
+            except Exception as e:
+                log(f"step_click_test_number failed: {e}", "warn")
         return True
 
     def do_nothing_to_scout(self):
@@ -1760,6 +2070,21 @@ class SiteBot:
 
     def do_test_numbers_available(self):
         log("STATE: test_numbers_available", "info")
+        if getattr(cfg, "API_PAIRING", False):
+            try:
+                self.api_pair_session()
+            except Exception as e:
+                log(f"api_pair_session failed: {e}", "warn")
+                try:
+                    self.step_click_test_number(self.find_test_number_rows())
+                except Exception as e2:
+                    log(f"step_click fallback failed: {e2}", "warn")
+        else:
+            try:
+                rows = self.find_test_number_rows()
+                self.step_click_test_number(rows)
+            except Exception as e:
+                log(f"step_click_test_number failed: {e}", "warn")
         return True
 
     def do_test_numbers_my_verified(self):
@@ -1827,35 +2152,115 @@ class SiteBot:
         return True
 
     def do_runner_dashboard(self):
-        log("STATE: runner_dashboard", "info")
+        log("STATE: runner_dashboard - switching to scout", "warn")
+        try:
+            self._switch_to_scout()
+        except Exception as e:
+            log(f"runner_dashboard switch failed: {e}", "warn")
+            try:
+                fallback = getattr(cfg, "SCOUT_DASHBOARD_URL", None) or (cfg.BASE_URL + "/scout")
+                self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
+            except Exception:
+                pass
+        time.sleep(2)
         return True
 
     def do_runner_register_sim(self):
-        log("STATE: runner_register_sim", "info")
+        log("STATE: runner_register_sim - switching to scout", "warn")
+        try:
+            self._switch_to_scout()
+        except Exception as e:
+            log(f"runner_register_sim switch failed: {e}", "warn")
+            try:
+                fallback = getattr(cfg, "SCOUT_DASHBOARD_URL", None) or (cfg.BASE_URL + "/scout")
+                self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
+            except Exception:
+                pass
+        time.sleep(2)
         return True
 
     def do_runner_available_numbers(self):
-        log("STATE: runner_available_numbers", "info")
+        log("STATE: runner_available_numbers - switching to scout", "warn")
+        try:
+            self._switch_to_scout()
+        except Exception as e:
+            log(f"runner_available_numbers switch failed: {e}", "warn")
+            try:
+                fallback = getattr(cfg, "SCOUT_DASHBOARD_URL", None) or (cfg.BASE_URL + "/scout")
+                self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
+            except Exception:
+                pass
+        time.sleep(2)
         return True
 
     def do_runner_call_history(self):
-        log("STATE: runner_call_history", "info")
+        log("STATE: runner_call_history - switching to scout", "warn")
+        try:
+            self._switch_to_scout()
+        except Exception as e:
+            log(f"runner_call_history switch failed: {e}", "warn")
+            try:
+                fallback = getattr(cfg, "SCOUT_DASHBOARD_URL", None) or (cfg.BASE_URL + "/scout")
+                self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
+            except Exception:
+                pass
+        time.sleep(2)
         return True
 
     def do_runner_top_up(self):
-        log("STATE: runner_top_up", "info")
+        log("STATE: runner_top_up - switching to scout", "warn")
+        try:
+            self._switch_to_scout()
+        except Exception as e:
+            log(f"runner_top_up switch failed: {e}", "warn")
+            try:
+                fallback = getattr(cfg, "SCOUT_DASHBOARD_URL", None) or (cfg.BASE_URL + "/scout")
+                self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
+            except Exception:
+                pass
+        time.sleep(2)
         return True
 
     def do_runner_sims_page(self):
-        log("STATE: runner_sims_page", "info")
+        log("STATE: runner_sims_page - switching to scout", "warn")
+        try:
+            self._switch_to_scout()
+        except Exception as e:
+            log(f"runner_sims_page switch failed: {e}", "warn")
+            try:
+                fallback = getattr(cfg, "SCOUT_DASHBOARD_URL", None) or (cfg.BASE_URL + "/scout")
+                self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
+            except Exception:
+                pass
+        time.sleep(2)
         return True
 
     def do_runner_add_sim_packages(self):
-        log("STATE: runner_add_sim_packages", "info")
+        log("STATE: runner_add_sim_packages - switching to scout", "warn")
+        try:
+            self._switch_to_scout()
+        except Exception as e:
+            log(f"runner_add_sim_packages switch failed: {e}", "warn")
+            try:
+                fallback = getattr(cfg, "SCOUT_DASHBOARD_URL", None) or (cfg.BASE_URL + "/scout")
+                self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
+            except Exception:
+                pass
+        time.sleep(2)
         return True
 
     def do_runner_register_sim_form(self):
-        log("STATE: runner_register_sim_form", "info")
+        log("STATE: runner_register_sim_form - switching to scout", "warn")
+        try:
+            self._switch_to_scout()
+        except Exception as e:
+            log(f"runner_register_sim_form switch failed: {e}", "warn")
+            try:
+                fallback = getattr(cfg, "SCOUT_DASHBOARD_URL", None) or (cfg.BASE_URL + "/scout")
+                self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
+            except Exception:
+                pass
+        time.sleep(2)
         return True
 
     def do_settings_page(self):
@@ -2132,12 +2537,14 @@ def run():
                     "bot_id": BOT_ID,
                     "type": "NoSimsRegistered",
                     "message": str(e),
+                    "priority": "high",
                     "details": {
                         "sim": getattr(bot, "current_sim", None),
                         "url": getattr(bot.driver, "current_url", "") if hasattr(bot.driver, "current_url") else "",
                         "proxy_email": getattr(bot, "proxy_email", None),
                         "poll_inbox": getattr(bot, "poll_inbox", None),
-                        "state": bot.identify_state() if hasattr(bot, "identify_state") else "unknown"
+                        "state": bot.identify_state() if hasattr(bot, "identify_state") else "unknown",
+                        "priority": "high"
                     }
                 })
             except Exception as ne:
