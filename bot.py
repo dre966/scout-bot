@@ -2298,17 +2298,44 @@ class SiteBot:
             return False
 
     def _select_country_us(self):
-        # Helper: open country dropdown and pick US / United States
+        # Helper: open country dropdown and pick US / United States — robust for react-select / shadcn
         try:
-            # Click dropdown trigger
+            time.sleep(0.8)
+            # 1) try JS to find clickable US option directly (even without opening dropdown)
+            try:
+                js = """
+                var t=null;
+                var texts=['United States','United States of America'];
+                var all=document.querySelectorAll('*');
+                for(var i=0;i<all.length;i++){
+                  var el=all[i];
+                  var txt=(el.innerText||'').trim();
+                  if(txt==='United States' || txt.startsWith('United States')){
+                    // must be selectable option (not heading)
+                    if(el.tagName==='DIV' || el.tagName==='LI' || el.tagName==='BUTTON'){
+                      t=el; break;
+                    }
+                  }
+                }
+                if(t){ t.scrollIntoView({block:'center'}); t.click(); return t.innerText; }
+                return null;
+                """
+                res = self.driver.execute_script(js)
+                if res and "United States" in str(res):
+                    log(f"_select_country_us: JS direct click '{res[:30]}'", "ok")
+                    time.sleep(0.8)
+                    return True
+            except Exception as e:
+                log(f"_select_country_us JS direct failed: {e}", "warn")
+            # 2) open dropdown trigger
             trigger = None
-            for sel in ['button', 'div[role="combobox"]', 'input[placeholder*="country" i]']:
+            for sel in ['button', 'div[role="combobox"]', 'input[placeholder*="country" i]', 'div[class*="select"]']:
                 try:
                     els = self.driver.find_elements(By.CSS_SELECTOR, sel)
                     for el in els:
                         try:
-                            txt = (el.text or "") + (el.get_attribute("placeholder") or "")
-                            if "Choose a country" in txt or "Select your country" in txt or "country" in txt.lower():
+                            txt = (el.text or "") + (el.get_attribute("placeholder") or "") + (el.get_attribute("aria-label") or "")
+                            if "Choose a country" in txt or "Select your country" in txt or "country" in txt.lower() or "United States" in txt:
                                 trigger = el
                                 break
                         except: continue
@@ -2318,26 +2345,52 @@ class SiteBot:
                 trigger = self.find_button_with_text("Choose a country")
             if trigger is None:
                 trigger = self.find_button_with_text("Select your country")
+            if trigger is None:
+                # fallback: first combobox
+                cbs = self.driver.find_elements(By.CSS_SELECTOR, 'div[role="combobox"]')
+                if cbs: trigger = cbs[0]
             if trigger is not None:
+                try:
+                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", trigger)
+                except: pass
                 self.click(trigger, label="country dropdown")
-                time.sleep(1)
-            # Pick US
-            us_opt = None
-            for txt in ["United States", "US -", "US ", "United States of America"]:
-                us_opt = self.find_button_with_text(txt)
-                if us_opt: break
-            if us_opt is None:
-                # search div options
-                for el in self.driver.find_elements(By.TAG_NAME, "div"):
+                time.sleep(1.2)
+            # 3) wait for options list to appear and pick US
+            for attempt in range(3):
+                us_opt = None
+                for txt in ["United States", "US -", "United States of America"]:
+                    us_opt = self.find_button_with_text(txt)
+                    if us_opt: break
+                if us_opt is None:
+                    for el in self.driver.find_elements(By.TAG_NAME, "div"):
+                        try:
+                            if (el.text or "").strip() == "United States":
+                                us_opt = el
+                                break
+                        except: continue
+                if us_opt is None:
+                    for el in self.driver.find_elements(By.TAG_NAME, "li"):
+                        try:
+                            if "United States" in (el.text or ""):
+                                us_opt = el
+                                break
+                        except: continue
+                if us_opt is not None:
                     try:
-                        if "United States" in (el.text or ""):
-                            us_opt = el
-                            break
-                    except: continue
-            if us_opt is not None:
-                self.click(us_opt, label="US option")
-                time.sleep(0.8)
-                return True
+                        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", us_opt)
+                    except: pass
+                    self.click(us_opt, label="US option")
+                    time.sleep(0.8)
+                    # confirm selection stuck (dropdown closed)
+                    try:
+                        # check if trigger now shows United States
+                        body = self.get_body_text()
+                        if "United States" in body:
+                            return True
+                    except: pass
+                    return True
+                time.sleep(0.6)
+            log("_select_country_us: US option not found after opening", "warn")
         except Exception as e:
             log(f"_select_country_us failed: {e}", "warn")
         return False
