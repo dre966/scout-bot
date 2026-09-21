@@ -24,4 +24,9 @@ services:
       - GMAIL_FAXCHECK2_APP_PASSWORD=${GMAIL_FAXCHECK2_APP_PASSWORD:-}
       - GMAIL_APP_PASSWORD=${GMAIL_APP_PASSWORD:-}
       - LICENSE_ID=${LICENSE_ID:-}
+      - SERVER_URL=${SERVER_URL:-http://host.docker.internal/scout-server/api}
+      - XAMPP_SERVER_URL=${XAMPP_SERVER_URL:-http://host.docker.internal/scout-server/api}
+      - BOT_TOKEN=${BOT_TOKEN:-scout-secret}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped

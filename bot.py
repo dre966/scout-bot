@@ -49,6 +49,141 @@ PHONE_NUMBER_RE = re.compile(cfg.PHONE_NUMBER_PATTERN)
 BOT_ID = int(os.getenv("BOT_ID", "0") or "0")
 BOT_EMAIL = os.getenv("BOT_EMAIL", "").strip() or None
 
+# XAMPP comms server wiring - Docker uses host.docker.internal to reach XAMPP on host
+SERVER_URL = os.getenv("SERVER_URL", os.getenv("XAMPP_SERVER_URL", "http://host.docker.internal/scout-server/api"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "scout-secret")
+
+
+def _post_to_server(endpoint, payload):
+    """POST payload to XAMPP comms server. Silent fail - log warn but don't crash if unreachable."""
+    try:
+        url = f"{SERVER_URL.rstrip('/')}/{endpoint.lstrip('/')}"
+        requests.post(url, json=payload, headers={"X-Bot-Token": BOT_TOKEN}, timeout=2)
+    except Exception as e:
+        log(f"server post {endpoint} failed: {e}", "warn")
+
+
+def _get_from_server(endpoint, params=None):
+    """GET from comms server with auth. Returns parsed JSON or None on fail."""
+    try:
+        url = f"{SERVER_URL.rstrip('/')}/{endpoint.lstrip('/')}"
+        r = requests.get(url, params=params or {}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+        if r.ok:
+            return r.json()
+        log(f"server get {endpoint} http={r.status_code}", "warn")
+    except Exception as e:
+        log(f"server get {endpoint} failed: {e}", "warn")
+    return None
+
+
+def _extract_auth_token(driver):
+    """Robustly extract bearer token from browser storage.
+    Checks cv-auth-storage (capture_token.py key: state.token), Supabase keys, etc.
+    Returns raw token string or None.
+    """
+    js = r"""
+    try {
+        const keys = [
+            'cv-auth-storage',
+            'auth',
+            'sb-yKqi0fu5vV6G4ryUIMJuzw-auth-token',
+            'sb-auth-token',
+            'token',
+            'access_token'
+        ];
+        function tryParse(v){
+            if (!v) return null;
+            v = v.trim();
+            if (!v) return null;
+            // try JSON
+            try {
+                const o = JSON.parse(v);
+                if (typeof o === 'string' && o.length > 20) return o;
+                if (o.state && o.state.token) return o.state.token;
+                if (o.token) return o.token;
+                if (o.access_token) return o.access_token;
+                if (o.accessToken) return o.accessToken;
+                if (o.currentSession && o.currentSession.access_token) return o.currentSession.access_token;
+                if (o.session && o.session.access_token) return o.session.access_token;
+                // supabase format: {access_token: ..., ...}
+                if (o.access_token) return o.access_token;
+            } catch(e) {
+                // plain string token (maybe JWT)
+                if (v.length > 20 && v.split('.').length === 3) return v;
+                if (v.length > 20 && v.startsWith('eyJ')) return v;
+            }
+            return null;
+        }
+        // explicit keys first
+        for (const k of keys) {
+            try {
+                let v = localStorage.getItem(k);
+                let t = tryParse(v);
+                if (t) return t;
+            } catch(e) {}
+            try {
+                let v = sessionStorage.getItem(k);
+                let t = tryParse(v);
+                if (t) return t;
+            } catch(e) {}
+        }
+        // scan all localStorage keys for anything containing auth/token
+        try {
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (!k) continue;
+                const kl = k.toLowerCase();
+                if (kl.includes('auth') || kl.includes('token') || kl.includes('sb-')) {
+                    let v = localStorage.getItem(k);
+                    let t = tryParse(v);
+                    if (t) return t;
+                }
+            }
+        } catch(e) {}
+        try {
+            for (let i = 0; i < sessionStorage.length; i++) {
+                const k = sessionStorage.key(i);
+                if (!k) continue;
+                const kl = k.toLowerCase();
+                if (kl.includes('auth') || kl.includes('token') || kl.includes('sb-')) {
+                    let v = sessionStorage.getItem(k);
+                    let t = tryParse(v);
+                    if (t) return t;
+                }
+            }
+        } catch(e) {}
+        // cookie fallback - look for jwt pattern
+        try {
+            const c = document.cookie || '';
+            // try to extract bearer-like tokens from cookies values
+            const parts = c.split(';');
+            for (const p of parts) {
+                const v = p.split('=')[1] || '';
+                const t = tryParse(v.trim());
+                if (t) return t;
+                const vt = v.trim();
+                if (vt.length > 30 && vt.split('.').length === 3) return vt;
+            }
+        } catch(e) {}
+        return null;
+    } catch(e) { return null; }
+    """
+    try:
+        token = driver.execute_script(f"return (function(){{{js}}})()")
+        if token and isinstance(token, str):
+            token = token.strip()
+            # strip Bearer prefix if present
+            if token.lower().startswith("bearer "):
+                token = token[7:].strip()
+            # strip surrounding quotes
+            token = token.strip('"').strip("'")
+            if len(token) > 20:
+                return token
+    except Exception as e:
+        log(f"extract token js failed: {e}", "warn")
+    return None
+
+
 STATES = [
     "max_sessions",
     "keep_testing_dialog",
@@ -217,6 +352,18 @@ def build_container_xpath(classes):
 class SiteBot:
     def __init__(self, driver):
         self.driver = driver
+        self.bot_id = BOT_ID
+        # proxy identity - resolve once via routing.json; refreshed on heartbeat if needed
+        try:
+            _pe, _pi, _entry = self.get_proxy_email_and_inbox()
+        except Exception:
+            _pe = os.getenv("BOT_EMAIL", "").strip() or BOT_EMAIL or "unknown"
+            _pi = "unknown"
+            _entry = {}
+        self.proxy_email = _pe
+        self.poll_inbox = _pi
+        self.proxy_entry = _entry
+        self.noted_proxy = None
         self.container_xpath = build_container_xpath(cfg.CONTAINER_CLASSES)
         self.noted_phone_number = None
         self.tested_numbers = set()
@@ -236,6 +383,7 @@ class SiteBot:
         self.saved_dispositions = None
         self.api_token = None
         self.current_sim_id = None
+        self._last_command_poll = 0
 
         # Dispatch dictionary: state -> handler
         self.STATE_HANDLERS = {
@@ -1732,11 +1880,120 @@ class SiteBot:
             pass
         return False
 
+    # -- server-coordinated helpers (command polling) ----------------------
+
+    def _poll_commands(self):
+        """Poll server for pending commands every 2-3s (called at start of tick).
+        Handles get_auth_token and refresh without blocking tick.
+        """
+        now = time.time()
+        if now - getattr(self, "_last_command_poll", 0) < 2.5:
+            return
+        self._last_command_poll = now
+        try:
+            url = f"{SERVER_URL.rstrip('/')}/command.php"
+            r = requests.get(url, params={"bot_id": BOT_ID}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+            if not r.ok:
+                return
+            data = r.json()
+            cmds = data.get("commands") or []
+            if not cmds:
+                return
+            for cmd_row in cmds:
+                cmd_id = cmd_row.get("id")
+                raw_cmd = (cmd_row.get("cmd") or "").strip()
+                cmd_lower = raw_cmd.lower()
+                args = cmd_row.get("args") or {}
+                log(f"[cmd] received {raw_cmd} id={cmd_id}", "info")
+                try:
+                    if cmd_lower in ("get_auth_token", "get_token", "getauthtoken"):
+                        token = _extract_auth_token(self.driver)
+                        if token:
+                            log(f"[cmd] get_auth_token success ...{token[-8:]}", "ok")
+                            # POST to bot_token.php
+                            try:
+                                post_url = f"{SERVER_URL.rstrip('/')}/bot_token.php"
+                                payload = {
+                                    "bot_id": BOT_ID,
+                                    "token": token,
+                                    "proxy_email": getattr(self, "proxy_email", None),
+                                    "poll_inbox": getattr(self, "poll_inbox", None),
+                                }
+                                pr = requests.post(post_url, json=payload, headers={"X-Bot-Token": BOT_TOKEN}, timeout=5)
+                                if pr.ok:
+                                    log("[cmd] bot_token posted ok", "ok")
+                                else:
+                                    log(f"[cmd] bot_token post failed http={pr.status_code} {pr.text[:150]}", "warn")
+                            except Exception as e:
+                                log(f"[cmd] bot_token post exception: {e}", "warn")
+                        else:
+                            log("[cmd] get_auth_token: no token found in storage", "warn")
+                        # ack as done regardless so queue doesn't stall
+                        try:
+                            ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                            requests.post(ack_url, json={"command_id": cmd_id, "status": "done", "bot_id": BOT_ID, "message": "token posted" if token else "no token"}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                        except Exception:
+                            pass
+                    elif cmd_lower in ("refresh", "reload", "restart"):
+                        log("[cmd] refresh -> driver.refresh()", "info")
+                        try:
+                            self.driver.refresh()
+                            time.sleep(1.2)
+                        except Exception as e:
+                            log(f"[cmd] refresh failed: {e}", "warn")
+                        try:
+                            ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                            requests.post(ack_url, json={"command_id": cmd_id, "status": "done", "bot_id": BOT_ID, "message": "refreshed"}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                        except Exception:
+                            pass
+                    else:
+                        # generic commands (PAUSE etc.) - ack as acked, let state handlers deal if needed
+                        try:
+                            ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                            requests.post(ack_url, json={"command_id": cmd_id, "status": "acked", "bot_id": BOT_ID}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                        except Exception:
+                            pass
+                        # also handle PAUSE/RESUME side effects if needed: just ack
+                        log(f"[cmd] unhandled cmd {raw_cmd} acked", "warn")
+                except Exception as e:
+                    log(f"[cmd] handler error for {raw_cmd}: {e}", "error")
+                    try:
+                        ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                        requests.post(ack_url, json={"command_id": cmd_id, "status": "failed", "bot_id": BOT_ID, "message": str(e)}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                    except Exception:
+                        pass
+        except Exception as e:
+            log(f"_poll_commands failed: {e}", "warn")
+
     # -- tick dispatcher (two-phase) ---------------------------------------
 
     def tick(self):
+        # Poll server commands first (non-blocking, every ~2.5s)
+        try:
+            self._poll_commands()
+        except Exception as e:
+            log(f"poll_commands exception: {e}", "warn")
         state = self.identify_state()
         log(f"[state] {state}")
+        # heartbeat to XAMPP comms server (silent fail so bot never dies if XAMPP down)
+        try:
+            _proxy = getattr(self, "noted_proxy", None) or getattr(self, "proxy_email", None)
+            _poll = getattr(self, "poll_inbox", None)
+            if not _proxy:
+                try:
+                    _proxy, _poll, _ = self.get_proxy_email_and_inbox()
+                except Exception:
+                    pass
+            _post_to_server("heartbeat.php", {
+                "bot_id": BOT_ID,
+                "proxy_email": _proxy,
+                "poll_inbox": _poll,
+                "state": state,
+                "sims_count": getattr(self, "stored_verification_count", 0),
+                "current_url": self.driver.current_url if hasattr(self.driver, "current_url") else ""
+            })
+        except Exception as e:
+            log(f"heartbeat post failed: {e}", "warn")
         handler = self.STATE_HANDLERS.get(state, self.do_unknown)
         return handler()
 
@@ -1844,6 +2101,16 @@ def run():
     # compat: expose running flag if needed
     bot.running = True
     log(f"Bot started on port {port}", "ok")
+    # register with XAMPP comms server (silent fail)
+    try:
+        _post_to_server("register.php", {
+            "bot_id": BOT_ID,
+            "proxy_email": getattr(bot, "proxy_email", None),
+            "poll_inbox": getattr(bot, "poll_inbox", None),
+            "container_id": os.getenv("HOSTNAME", "bot")
+        })
+    except Exception as e:
+        log(f"register post failed: {e}", "warn")
 
     while getattr(bot, "running", True):
         try:
@@ -1860,6 +2127,21 @@ def run():
                 bot.log.error(f"NoSimsRegistered: {e}", details={"sim": getattr(bot, "current_sim", None), "url": getattr(bot.driver, "current_url", "")})
             except Exception:
                 pass
+            try:
+                _post_to_server("notify.php", {
+                    "bot_id": BOT_ID,
+                    "type": "NoSimsRegistered",
+                    "message": str(e),
+                    "details": {
+                        "sim": getattr(bot, "current_sim", None),
+                        "url": getattr(bot.driver, "current_url", "") if hasattr(bot.driver, "current_url") else "",
+                        "proxy_email": getattr(bot, "proxy_email", None),
+                        "poll_inbox": getattr(bot, "poll_inbox", None),
+                        "state": bot.identify_state() if hasattr(bot, "identify_state") else "unknown"
+                    }
+                })
+            except Exception as ne:
+                log(f"notify post failed: {ne}", "warn")
             # Keep chrome open, sleep and retry (server can detect via logs)
             time.sleep(60)
             continue
