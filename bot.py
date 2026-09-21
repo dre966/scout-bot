@@ -1452,27 +1452,11 @@ class SiteBot:
         return True
 
     def do_verification_ended(self):
-        log("STATE: verification_ended - human/voicemail detected, going back", "warn")
-        try:
-            self.log.session_terminal("verification_ended")
-        except Exception:
-            pass
+        log("STATE: verification_ended")
+        self.log.session_terminal("verification_ended")
         self.call_count = 0
-        # also reset disposition so next session starts clean
-        self.session_disposition = None
         btn = self.find_button_with_text(cfg.TRIGGERS["back_to_available_button"])
-        if btn is not None:
-            self.click(btn, label=cfg.TRIGGERS["back_to_available_button"])
-            time.sleep(1)
-            return True
-        # fallback: try generic Back text
-        btn2 = self.find_button_with_text("Back")
-        if btn2 is not None:
-            self.click(btn2, label="Back")
-            time.sleep(1)
-            return True
-        log("verification_ended: Back button not found", "warn")
-        return False
+        self.click(btn, label=cfg.TRIGGERS["back_to_available_button"])
 
     def do_suspended(self):
         log("STATE: suspended", "error")
@@ -1638,332 +1622,158 @@ class SiteBot:
             return False
 
     def do_package_select(self):
-        log("STATE: package_select - selecting package option", "info")
-        try:
-            self.show_progress()
-        except Exception:
-            pass
-        try:
-            btn = self.find_button_with_text(cfg.PACKAGE_OPTION_BUTTON)
-            if btn is None:
-                btn = self.find_button_with_text(cfg.TRIGGERS["heard_ivr_button"])
-            if btn is not None:
-                self.click(btn, label=cfg.PACKAGE_OPTION_BUTTON, testing_mode=True)
-                return True
-            log("package_select: option button not found", "warn")
-            return False
-        except Exception as e:
-            log(f"package_select failed: {e}", "warn")
-            return False
+        log("STATE: package_select")
+        self.show_progress()
+        btn = self.find_button_with_text(cfg.PACKAGE_OPTION_BUTTON)
+        self.click(btn, label=cfg.PACKAGE_OPTION_BUTTON, testing_mode=True)
 
     def do_select_one(self):
-        log("STATE: select_one - What did you hear?", "info")
-        try:
-            self.show_progress()
-        except Exception:
-            pass
-        # simplified: always pick safe incorrect IVR (no reuse, no random)
+        log("STATE: select_one")
+        self.show_progress()
         label = "I heard an IVR, but it was incorrect"
         self.session_disposition = label
-        self.session_disposition_category = "negative"
-        log(f"Disposition chosen: {label}", "info")
-        try:
-            self.log.disposition_chosen(label)
-        except Exception:
-            pass
-        # Click via JS exact text match to avoid stale issues
-        try:
-            label_escaped = label.replace("\\", "\\\\").replace("'", "\\'")
-            js = f"""
-            var btns = document.querySelectorAll('button');
-            for (var i = 0; i < btns.length; i++) {{
-                if (btns[i].textContent.trim() === '{label_escaped}') {{
-                    btns[i].scrollIntoView({{block:'center'}});
-                    btns[i].click();
-                    return btns[i].textContent.trim();
-                }}
+        if label in cfg.NEGATIVE_OPTIONS:
+            self.session_disposition_category = "negative"
+        log(f"disposition {label}")
+        self.log.disposition_chosen(label)
+        label_escaped = label.replace("\\", "\\\\").replace("'", "\\'")
+        js = f"""
+        var btns = document.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {{
+            if (btns[i].textContent.trim() === '{label_escaped}') {{
+                btns[i].scrollIntoView({{block:'center'}});
+                btns[i].click();
+                return btns[i].textContent.trim();
             }}
-            return null;
-            """
-            result = self.driver.execute_script(js)
-            if result:
-                log(f"Clicked disposition: {result}", "ok")
-                return True
-            # fallback: partial match via helper
-            btn = self.find_button_with_text(label)
-            if btn is not None:
-                self.click(btn, label=label, testing_mode=True)
-                return True
-            log(f"select_one: button for '{label}' not found", "warn")
-            return False
-        except Exception as e:
-            log(f"select_one failed: {e}", "warn")
-            try:
-                btn = self.find_button_with_text(label)
-                if btn is not None:
-                    self.click(btn, label=label, testing_mode=True)
-                    return True
-            except Exception:
-                pass
-            return False
+        }}
+        return null;
+        """
+        result = self.driver.execute_script(js)
+        if result:
+            log(f"Clicked: {result}")
+        else:
+            log(f"Could not find button for '{label}'", "warn")
 
     def do_call_completed(self):
-        log("STATE: call_completed - Call X of 5 Completed", "ok")
-        try:
-            # update call_count from page then increment logically
-            parsed = self.parse_call_count()
-            if parsed is not None:
-                self.call_count = parsed
-            else:
-                self.call_count += 1
-            # also show progress
-            try:
-                self.show_progress(skip_verification_parse=True)
-            except Exception:
-                pass
-            log(f"Call {self.call_count}/5 completed", "ok")
-            btn = self.find_button_with_text(cfg.TRIGGERS["start_next_call_button"])
-            if btn is None:
-                btn = self.find_button_with_text("Start call")
-            if btn is not None:
-                self.click(btn, label=cfg.TRIGGERS["start_next_call_button"], testing_mode=True)
-                return True
-            log("call_completed: Start next call button not found", "warn")
-            return False
-        except Exception as e:
-            log(f"call_completed failed: {e}", "warn")
-            return False
+        log("STATE: call_completed")
+        self.call_count += 1
+        self.show_progress()
+        btn = self.find_button_with_text(cfg.TRIGGERS["start_next_call_button"])
+        self.click(btn, label=cfg.TRIGGERS["start_next_call_button"], testing_mode=True)
 
     def do_verification_complete(self):
-        log("STATE: verification_complete - Verification Complete!", "ok")
-        try:
-            self.stored_verification_count += 1
-            self.call_count = 0
-            if getattr(self, "test_start_time", None):
-                try:
-                    elapsed = time.time() - self.test_start_time
-                    log(f"Total time {elapsed:.1f}s, 5/5 calls", "ok")
-                    self.test_start_time = None
-                except Exception:
-                    pass
-            try:
-                self.log.session_complete(total_calls=5, verifications=self.stored_verification_count)
-            except Exception:
-                pass
-            try:
-                self.show_progress(skip_verification_parse=True)
-            except Exception:
-                pass
-            if self.stored_verification_count >= 8:
-                log("SIM reached 8/8 verifications - switching to new SIM", "warn")
-                self.current_sim_id = None
-            # small delay before next session (ban evasion / human-like)
-            try:
-                delay = random.uniform(cfg.NEXT_DELAY_MIN, cfg.NEXT_DELAY_MAX)
-                log(f"Verification complete - waiting {delay:.1f}s", "info")
-                time.sleep(delay)
-            except Exception:
-                time.sleep(0.8)
-            btn = self.find_button_with_text(cfg.TRIGGERS["back_to_available_button"])
-            if btn is None:
-                btn = self.find_button_with_text("Back to Available")
-            if btn is not None:
-                self.click(btn, label=cfg.TRIGGERS["back_to_available_button"])
-                time.sleep(1)
-                return True
-            log("verification_complete: Back button not found", "warn")
-            return False
-        except Exception as e:
-            log(f"verification_complete failed: {e}", "warn")
-            return False
+        log("STATE: verification_complete")
+        self.stored_verification_count += 1
+        self.call_count = 0
+        if self.test_start_time:
+            elapsed = time.time() - self.test_start_time
+            log(f"Total time {elapsed:.1f}s")
+            log(f"Calls completed 5/5")
+            self.test_start_time = None
+        self.log.session_complete(total_calls=5, verifications=self.stored_verification_count)
+        self.show_progress(skip_verification_parse=True)
+        if self.stored_verification_count >= 8:
+            log("SIM reached 8/8 verifications - switching to new SIM", "warn")
+            self.current_sim_id = None
+        delay = random.uniform(cfg.NEXT_DELAY_MIN, cfg.NEXT_DELAY_MAX)
+        log(f"completed session - waiting {delay:.1f}s")
+        time.sleep(delay)
+        btn = self.find_button_with_text(cfg.TRIGGERS["back_to_available_button"])
+        self.click(btn, label=cfg.TRIGGERS["back_to_available_button"])
 
     def do_call_this_number(self):
-        log("STATE: call_this_number - Call this number using your approved", "info")
-        try:
-            self.show_progress()
-        except Exception:
-            pass
-        # Ensure phone noted
-        try:
-            if not self.noted_phone_number:
-                phone = self._get_phone_number_from_page()
-                if phone:
-                    self.noted_phone_number = phone
-        except Exception:
-            pass
-        # 15% chance of "The call did not connect" (only here, not on continue_verification)
-        try:
-            if random.random() < getattr(cfg, "NO_CONNECT_CHANCE", 0.15):
-                btn = self.find_button_with_text("The call did not connect")
-                if btn is not None:
-                    log("The call did not connect (random 15%)", "info")
-                    self.session_disposition = "The call did not connect"
-                    try:
-                        self.log.disposition_chosen(self.session_disposition)
-                    except Exception:
-                        pass
-                    self.click(btn, label="The call did not connect", testing_mode=True)
-                    return True
-        except Exception:
-            pass
-        # Default: always click "I heard audio" (no saved disposition logic)
-        try:
-            btn = self.find_button_with_text(cfg.TRIGGERS["heard_ivr_button"])
-            if btn is None:
-                btn = self.find_button_with_text("I heard audio")
-            if btn is not None:
-                self.click(btn, label=cfg.TRIGGERS["heard_ivr_button"], testing_mode=True)
-                return True
-            log("call_this_number: I heard audio button not found", "warn")
-            return False
-        except Exception as e:
-            log(f"call_this_number failed: {e}", "warn")
-            return False
+        log("STATE: call_this_number")
+        self.show_progress()
+        if not self.noted_phone_number:
+            phone = self._get_phone_number_from_page()
+            if phone:
+                self.noted_phone_number = phone
+        if random.random() < cfg.NO_CONNECT_CHANCE:
+            btn = self.find_button_with_text("The call did not connect")
+            if btn:
+                log("The call did not connect")
+                self.click(btn, label="The call did not connect", testing_mode=True)
+                return
+        btn = self.find_button_with_text(cfg.TRIGGERS["heard_ivr_button"])
+        self.click(btn, label=cfg.TRIGGERS["heard_ivr_button"], testing_mode=True)
 
     def do_continue_verification(self):
-        log("STATE: continue_verification - Continue Verification Session", "info")
-        try:
-            self.show_progress()
-        except Exception:
-            pass
-        # Ensure call_count is up to date from page before decision
-        try:
-            parsed = self.parse_call_count()
-            if parsed is not None:
-                self.call_count = parsed
-        except Exception:
-            pass
-        # Ensure phone noted
-        try:
-            if not self.noted_phone_number:
-                phone = self._get_phone_number_from_page()
-                if phone:
-                    self.noted_phone_number = phone
-        except Exception:
-            pass
-        # Call 5 -> Cancel attempt (ban evasion) - keep this
+        log("STATE: continue_verification")
+        self.show_progress()
         if self.call_count == 5:
-            log("Call 5 - cancelling attempt (ban evasion)", "warn")
-            try:
-                btn = self.find_button_with_text("Cancel attempt")
-                if btn is None:
-                    btn = self.find_button_with_text("Cancel")
-                if btn is not None:
-                    self.click(btn, label="Cancel attempt", testing_mode=True)
-                    time.sleep(1)
-                    try:
-                        textareas = self.driver.find_elements(By.TAG_NAME, "textarea")
-                        ta = textareas[0] if textareas else None
-                        if ta is not None:
-                            self.type_into(ta, "Call did not reach expected IVR", label="cancel reason")
-                            time.sleep(0.5)
-                    except Exception as e:
-                        log(f"continue_verification cancel textarea failed: {e}", "warn")
-                    cancel_btn = self.find_button_with_text("Cancel test")
-                    if cancel_btn is not None:
-                        self.click(cancel_btn, label="Cancel test", testing_mode=True)
-                        log("Attempt cancelled on call 5", "warn")
-                    else:
-                        cancel_btn2 = self.find_button_with_text("Cancel")
-                        if cancel_btn2 is not None:
-                            self.click(cancel_btn2, label="Cancel")
-                    time.sleep(1)
-                    return True
+            log("Call 5 — cancelling attempt...")
+            btn = self.find_button_with_text("Cancel attempt")
+            if btn:
+                self.click(btn, label="Cancel attempt", testing_mode=True)
+                time.sleep(1)
+                textarea = self.driver.find_elements(By.CSS_SELECTOR, "textarea")
+                textarea = textarea[0] if textarea else None
+                if textarea:
+                    self.type_into(textarea, "Call did not reach expected IVR", label="cancel reason")
+                    time.sleep(0.5)
+                cancel_btn = self.find_button_with_text("Cancel test")
+                if cancel_btn:
+                    self.click(cancel_btn, label="Cancel test", testing_mode=True)
+                    log("Attempt cancelled.")
                 else:
-                    log("continue_verification: Cancel attempt button not found", "warn")
-                    return False
-            except Exception as e:
-                log(f"continue_verification cancel failed: {e}", "warn")
-                return False
-        # For calls 2-4: always click "I heard audio" (simplified, no reuse, no disposition branching)
-        try:
-            btn = self.find_button_with_text(cfg.TRIGGERS["heard_ivr_button"])
-            if btn is None:
-                btn = self.find_button_with_text("I heard audio")
-            if btn is not None:
-                # keep a safe disposition for subsequent select_one
-                if not self.session_disposition:
-                    self.session_disposition = "I heard an IVR, but it was incorrect"
-                self.click(btn, label=cfg.TRIGGERS["heard_ivr_button"], testing_mode=True)
-                return True
-            log("continue_verification: I heard audio button not found", "warn")
-            return False
-        except Exception as e:
-            log(f"continue_verification failed: {e}", "warn")
-            return False
+                    log("Cancel test button not found", "warn")
+            else:
+                log("Cancel attempt button not found", "warn")
+            return
+        if random.random() < cfg.NO_CONNECT_CHANCE:
+            btn = self.find_button_with_text("The call did not connect")
+            if btn:
+                log("The call did not connect")
+                self.click(btn, label="The call did not connect", testing_mode=True)
+                return
+        btn = self.find_button_with_text(cfg.TRIGGERS["heard_ivr_button"])
+        self.click(btn, label=cfg.TRIGGERS["heard_ivr_button"], testing_mode=True)
 
     def do_call_result(self):
-        log("STATE: call_result - Submit remaining balance", "info")
-        try:
-            self.show_progress()
-        except Exception:
-            pass
-        # Simple voicemail check: go back
-        try:
-            body_text = (self.get_body_text() or "").lower()
-            if "voicemail" in body_text or "voice mail" in body_text:
-                log("Voicemail detected on result page - going back", "warn")
-                btn = self.find_button_with_text("Back")
-                if btn is not None:
-                    self.click(btn, label="Back", testing_mode=True)
-                    time.sleep(1.5)
-                    return True
-                try:
-                    self.driver.back()
-                    time.sleep(1.5)
-                except Exception:
-                    pass
-                return True
-        except Exception:
-            pass
-        # Type 60 into balance input (robust search)
-        try:
-            inp = None
-            for sel in ["input[type='number']", "input[type='text']", "input"]:
-                try:
-                    els = self.driver.find_elements(By.CSS_SELECTOR, sel)
-                    if els:
-                        for el in els:
-                            try:
-                                if el.is_displayed() and el.is_enabled():
-                                    inp = el
-                                    break
-                            except Exception:
-                                inp = el
-                                break
-                        if inp is not None:
-                            break
-                except Exception:
-                    continue
-            if inp is not None:
-                self.type_into(inp, cfg.BALANCE_INPUT_VALUE, label="remaining balance")
-                log(f"call_result: typed {cfg.BALANCE_INPUT_VALUE}", "info")
-                time.sleep(1.0)
+        log("STATE: call_result")
+        self.show_progress()
+        body_text = self.get_body_text()
+        if "voicemail" in body_text.lower():
+            log("Voicemail detected on result page — going back to retry", "warn")
+            btn = self.find_button_with_text("Back")
+            if btn:
+                self.click(btn, label="Back", testing_mode=True)
             else:
-                log("call_result: number input not found, trying submit directly", "warn")
-        except Exception as e:
-            log(f"call_result balance input failed: {e}", "warn")
-        # Submit (no notes complexity - just submit)
-        try:
+                self.driver.back()
+            time.sleep(1.5)
+            return
+        input_el = self.driver.find_elements(By.CSS_SELECTOR, "input[type='number']")
+        input_el = input_el[0] if input_el else None
+        self.type_into(input_el, cfg.BALANCE_INPUT_VALUE, label="remaining balance")
+        time.sleep(1.0)
+        if random.random() < cfg.NOTES_CHANCE:
+            note = random.choice(cfg.NOTES_POOL)
+            textareas = self.driver.find_elements(By.TAG_NAME, "textarea")
+            if textareas:
+                self.type_into(textareas[0], note, label="notes")
+                log(f"notes {note}")
+                time.sleep(0.5)
+        btn = None
+        textareas = self.driver.find_elements(By.TAG_NAME, "textarea")
+        if textareas:
+            try:
+                form = textareas[0].find_element(By.XPATH, "./ancestor::div[contains(@class,'flex') and contains(@class,'flex-col')]")
+                for b in form.find_elements(By.TAG_NAME, "button"):
+                    try:
+                        if _text_matches(b.text, cfg.TRIGGERS["submit_button"]):
+                            btn = b
+                            break
+                    except StaleElementReferenceException:
+                        continue
+            except (NoSuchElementException, StaleElementReferenceException):
+                pass
+        if btn is None:
             btn = self.find_button_with_text(cfg.TRIGGERS["submit_button"])
-            if btn is None:
-                btn = self.find_button_with_text("Submit")
-            if btn is not None:
-                try:
-                    if btn.get_attribute("disabled"):
-                        log("call_result: Submit disabled, waiting 1s...", "warn")
-                        time.sleep(1.0)
-                except Exception:
-                    pass
-                log(f"Submitting: {btn.text.strip()[:30]}", "info")
-                self.click(btn, label=cfg.TRIGGERS["submit_button"], testing_mode=True)
-                time.sleep(0.8)
-                return True
-            log("call_result: Submit button not found", "warn")
-            return False
-        except Exception as e:
-            log(f"call_result submit failed: {e}", "warn")
-            return False
+        if btn is not None and btn.get_attribute("disabled"):
+            log("Submit button still disabled after typing", "warn")
+            return
+        log(f"Submitting: {btn.text.strip() if btn else 'unknown'}")
+        self.click(btn, label=cfg.TRIGGERS["submit_button"], testing_mode=True)
 
     def do_sign_in_options(self):
         log("STATE: sign_in_options - clicking Sign In with Email", "info")
