@@ -1,0 +1,29 @@
+FROM python:3.11-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV DISPLAY=:99
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget gnupg2 unzip curl xvfb ca-certificates \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-chrome-stable \
+    && CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+') \
+    && wget -q "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}.0/linux64/chromedriver-linux64.zip" -O /tmp/chromedriver.zip \
+    && unzip /tmp/chromedriver.zip -d /tmp/ \
+    && mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver \
+    && chmod +x /usr/local/bin/chromedriver \
+    && rm -rf /tmp/chromedriver* /var/lib/apt/lists/*
+
+RUN mkdir -p /app /app/data /app/logs
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+RUN chmod +x /usr/local/bin/chromedriver
+
+# headless: only Xvfb, no x11vnc/websockify (saves ~150MB RAM, fits Railway 512MB)
+CMD ["bash", "-c", "Xvfb :99 -screen 0 1920x1080x24 & sleep 2 && python -u bot.py"]
