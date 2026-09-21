@@ -674,15 +674,11 @@ class SiteBot:
         return panel.find_elements(By.TAG_NAME, "button")
 
     def _switch_to_scout(self):
-        # Runner -> Scout requires role switch, not just navigation (runner can't access /scout/*)
-        # Try UI role switch: open profile menu -> click Switch to Scout
         try:
-            # 1. Try to open the user menu (bottom left card with email + Scout/Runner label)
             profile_btn = None
             for btn in self.driver.find_elements(By.TAG_NAME, "button"):
                 try:
                     txt = (btn.text or "") + (btn.get_attribute("innerText") or "")
-                    # profile button contains email or has chevrons-up-down
                     if "chevrons-up-down" in (btn.get_attribute("innerHTML") or ""):
                         profile_btn = btn
                         break
@@ -691,11 +687,9 @@ class SiteBot:
                         break
                 except StaleElementReferenceException:
                     continue
-            # fallback: find the gradient card button with email
             if profile_btn is None:
                 profile_btn = self.driver.find_elements(By.CSS_SELECTOR, "button.w-full.flex.items-center.gap-2")
                 profile_btn = profile_btn[0] if profile_btn else None
-
             if profile_btn is not None:
                 try:
                     self.click(profile_btn, label="profile menu")
@@ -706,20 +700,16 @@ class SiteBot:
                         time.sleep(1)
                     except Exception:
                         pass
-                # Now look for Switch to Scout button in the modal
                 switch_btn = self.find_button_with_text("Switch to Scout")
                 if switch_btn is not None:
                     log("_switch_to_scout: clicking Switch to Scout", "info")
                     self.click(switch_btn, label="Switch to Scout")
                     time.sleep(3)
-                    # After switch, navigate to scout
                     self.driver.get(cfg.TEST_NUMBERS_PAGE_URL)
                     time.sleep(2)
                     return
-                # If already Scout, no switch button, just navigate
                 if switch_btn is None:
                     log("_switch_to_scout: no Switch to Scout button, already Scout or modal not open", "info")
-            # Fallback: direct navigation (for accounts already have scout role)
             self.driver.get(cfg.TEST_NUMBERS_PAGE_URL)
             time.sleep(2)
         except Exception as e:
@@ -730,6 +720,47 @@ class SiteBot:
                 time.sleep(2)
             except Exception as e2:
                 log(f"_switch_to_scout fallback failed: {e2}", "warn")
+
+    def _switch_to_runner(self):
+        try:
+            profile_btn = None
+            for btn in self.driver.find_elements(By.TAG_NAME, "button"):
+                try:
+                    txt = (btn.text or "") + (btn.get_attribute("innerText") or "")
+                    if "chevrons-up-down" in (btn.get_attribute("innerHTML") or ""):
+                        profile_btn = btn
+                        break
+                    if "@" in txt and ("Scout" in txt or "Runner" in txt):
+                        profile_btn = btn
+                        break
+                except StaleElementReferenceException:
+                    continue
+            if profile_btn is None:
+                profile_btn = self.driver.find_elements(By.CSS_SELECTOR, "button.w-full.flex.items-center.gap-2")
+                profile_btn = profile_btn[0] if profile_btn else None
+            if profile_btn is not None:
+                try:
+                    self.click(profile_btn, label="profile menu")
+                    time.sleep(1)
+                except Exception:
+                    try:
+                        self.driver.execute_script("arguments[0].click();", profile_btn)
+                        time.sleep(1)
+                    except Exception:
+                        pass
+                switch_btn = self.find_button_with_text("Switch to Runner")
+                if switch_btn is not None:
+                    log("_switch_to_runner: clicking Switch to Runner", "info")
+                    self.click(switch_btn, label="Switch to Runner")
+                    time.sleep(3)
+                    self.driver.get(cfg.BASE_URL + "/runner")
+                    time.sleep(2)
+                    return
+                log("_switch_to_runner: no Switch to Runner button, already Runner", "info")
+            self.driver.get(cfg.BASE_URL + "/runner")
+            time.sleep(2)
+        except Exception as e:
+            log(f"_switch_to_runner failed: {e}", "warn")
 
     # -- disposition history helpers (restored from smart_call_yours.py) ----
 
