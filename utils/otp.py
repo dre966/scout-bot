@@ -85,7 +85,7 @@ def get_routing_entry(proxy_email):
 
 
 def fetch_otp_for_bot(bot_id=None, timeout=60, poll_interval=3):
-    """Fetch OTP for bot's proxy email via Gmail API.
+    """Fetch OTP for bot's proxy email via Gmail IMAP (App Password) with OAuth fallback.
 
     Args:
         bot_id: int BOT_ID, if None reads from env BOT_ID

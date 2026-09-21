@@ -8,7 +8,12 @@ honeypot_data.json
 config.json
 proxies.txt
 *.json
+# Keep these data files / package.json despite *.json and data/*
 !package.json
 !data/routing.json
 !data/gmail_credentials.json
 !data/gmail_token.json
+!data/.gitkeep
+# IMAP App Password - never commit (explicit, though data/* already ignores)
+data/gmail_app_password.txt
+data/gmail_app_password_*.txt

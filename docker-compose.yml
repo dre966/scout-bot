@@ -14,8 +14,14 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
     environment:
-      - BOT_MODE=2
-      - API_PAIRING=true
-      - POLL_INTERVAL=1.0
-      - HUMAN_LIKE_MODE=true
+      - BOT_MODE=${BOT_MODE:-2}
+      - BOT_ID=${BOT_ID:-0}
+      - BOT_EMAIL=${BOT_EMAIL:-}
+      - SITE_DOMAIN=${SITE_DOMAIN:-scoutandrunner.com}
+      - API_PAIRING=${API_PAIRING:-true}
+      - POLL_INTERVAL=${POLL_INTERVAL:-1.0}
+      - HUMAN_LIKE_MODE=${HUMAN_LIKE_MODE:-true}
+      - GMAIL_FAXCHECK2_APP_PASSWORD=${GMAIL_FAXCHECK2_APP_PASSWORD:-}
+      - GMAIL_APP_PASSWORD=${GMAIL_APP_PASSWORD:-}
+      - LICENSE_ID=${LICENSE_ID:-}
     restart: unless-stopped

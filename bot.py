@@ -1104,13 +1104,12 @@ class SiteBot:
             return False
 
     def do_otp_verification(self):
-        log("STATE: otp_verification - fetching OTP via Gmail API", "info")
+        log("STATE: otp_verification - fetching OTP via IMAP (App Password) for faxcheck2", "info")
         proxy_email, poll_inbox, entry = self.get_proxy_email_and_inbox()
-        log(f"otp_verification: proxy={proxy_email} poll_inbox={poll_inbox} timeout=60s", "info")
+        log(f"otp_verification: proxy={proxy_email} poll_inbox={poll_inbox} timeout=60s type={entry.get('type')}", "info")
 
-        # Fetch OTP via Gmail API
         otp_code = None
-        # Prefer utils.gmail fetch_otp if available
+        # Prefer utils.gmail fetch_otp (IMAP primary, OAuth fallback) if available
         fetch_fn = _fetch_otp
         if fetch_fn is None:
             try:
@@ -1118,8 +1117,7 @@ class SiteBot:
                 fetch_fn = _fn
             except ImportError:
                 try:
-                    from utils.otp import fetch_otp_for_bot as _fn2
-                    # will be handled below
+                    from utils.otp import fetch_otp_for_bot as _fn2  # noqa: F401
                     fetch_fn = None
                 except ImportError:
                     fetch_fn = None
@@ -1128,13 +1126,24 @@ class SiteBot:
             try:
                 otp_code = fetch_fn(proxy_email, poll_inbox, timeout=60, poll_interval=3)
             except Exception as e:
-                log(f"otp_verification: fetch_otp exception: {e}", "error")
-                self.log.error("otp_verification fetch failed", details={"error": str(e), "proxy": proxy_email, "poll_inbox": poll_inbox})
+                # Handle IMAP errors gracefully - log and continue to fallback
+                log(f"otp_verification: IMAP fetch_otp exception for {proxy_email} via {poll_inbox}: {e}", "error")
+                self.log.error("otp_verification IMAP fetch failed", details={"error": str(e), "proxy": proxy_email, "poll_inbox": poll_inbox, "hint": "Check GMAIL_FAXCHECK2_APP_PASSWORD / data/gmail_app_password.txt and IMAP enabled"})
+                # Try fallback wrapper for completeness
+                try:
+                    from utils.otp import fetch_otp_for_bot as _fallback
+                    try:
+                        bid = int(os.getenv("BOT_ID", str(BOT_ID)) or "0")
+                    except ValueError:
+                        bid = 0
+                    log("otp_verification: trying fallback fetch_otp_for_bot...", "warn")
+                    otp_code = _fallback(bot_id=bid, timeout=60, poll_interval=3)
+                except Exception as fe:
+                    log(f"otp_verification: fallback also failed: {fe}", "error")
         else:
-            # Fallback via utils.otp wrapper
+            # No direct fetch_fn, use utils.otp wrapper
             try:
                 from utils.otp import fetch_otp_for_bot
-                # Use BOT_ID from env
                 try:
                     bid = int(os.getenv("BOT_ID", str(BOT_ID)) or "0")
                 except ValueError:
@@ -1142,11 +1151,11 @@ class SiteBot:
                 otp_code = fetch_otp_for_bot(bot_id=bid, timeout=60, poll_interval=3)
             except Exception as e:
                 log(f"otp_verification: fallback fetch_otp_for_bot failed: {e}", "error")
-                self.log.error("otp_verification fallback failed", details={"error": str(e)})
+                self.log.error("otp_verification fallback failed", details={"error": str(e), "proxy": proxy_email, "poll_inbox": poll_inbox})
 
         if not otp_code:
-            log(f"otp_verification: no OTP found for {proxy_email} in 60s", "error")
-            self.log.error("otp_verification: no OTP found in 60s", details={"proxy": proxy_email, "poll_inbox": poll_inbox})
+            log(f"otp_verification: no OTP found for {proxy_email} in 60s (poll_inbox={poll_inbox}) - will retry next tick. Check IMAP App Password, forwarding, or email delay.", "error")
+            self.log.error("otp_verification: no OTP found in 60s", details={"proxy": proxy_email, "poll_inbox": poll_inbox, "hint": "Verify GMAIL_FAXCHECK2_APP_PASSWORD set and Cloudflare forwarding to faxcheck2@gmail.com active"})
             return False
 
         log(f"otp_verification: got OTP {otp_code[:2]}**{otp_code[-1]} for {proxy_email}", "ok")
