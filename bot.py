@@ -49,24 +49,31 @@ PHONE_NUMBER_RE = re.compile(cfg.PHONE_NUMBER_PATTERN)
 BOT_ID = int(os.getenv("BOT_ID", "0") or "0")
 BOT_EMAIL = os.getenv("BOT_EMAIL", "").strip() or None
 
-# XAMPP comms server wiring - Docker uses host.docker.internal to reach XAMPP on host
-SERVER_URL = os.getenv("SERVER_URL", os.getenv("XAMPP_SERVER_URL", "http://host.docker.internal/scout-server/api"))
+# Comms server wiring - Railway bot -> Render Postgres server
+# Pure env-driven: set SERVER_URL on Railway (e.g. https://scout-server-nm2m.onrender.com/api)
+# No hardcoded host.docker.internal fallback - if unset, server posts are no-ops (logs warn once)
+_raw_server = (os.getenv("SERVER_URL") or os.getenv("XAMPP_SERVER_URL") or os.getenv("SCOUT_SERVER_URL") or "").strip()
+SERVER_URL = _raw_server.rstrip("/")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "scout-secret")
 
 
 def _post_to_server(endpoint, payload):
-    """POST payload to XAMPP comms server. Silent fail - log warn but don't crash if unreachable."""
+    """POST payload to comms server. Silent fail - no-op if SERVER_URL not set."""
+    if not SERVER_URL:
+        return
     try:
-        url = f"{SERVER_URL.rstrip('/')}/{endpoint.lstrip('/')}"
-        requests.post(url, json=payload, headers={"X-Bot-Token": BOT_TOKEN}, timeout=2)
+        url = f"{SERVER_URL}/{endpoint.lstrip('/')}"
+        requests.post(url, json=payload, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
     except Exception as e:
         log(f"server post {endpoint} failed: {e}", "warn")
 
 
 def _get_from_server(endpoint, params=None):
-    """GET from comms server with auth. Returns parsed JSON or None on fail."""
+    """GET from comms server with auth. Returns parsed JSON or None on fail. No-op if SERVER_URL not set."""
+    if not SERVER_URL:
+        return None
     try:
-        url = f"{SERVER_URL.rstrip('/')}/{endpoint.lstrip('/')}"
+        url = f"{SERVER_URL}/{endpoint.lstrip('/')}"
         r = requests.get(url, params=params or {}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
         if r.ok:
             return r.json()

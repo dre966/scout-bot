@@ -24,9 +24,9 @@ services:
       - GMAIL_FAXCHECK2_APP_PASSWORD=${GMAIL_FAXCHECK2_APP_PASSWORD:-}
       - GMAIL_APP_PASSWORD=${GMAIL_APP_PASSWORD:-}
       - LICENSE_ID=${LICENSE_ID:-}
-      - SERVER_URL=${SERVER_URL:-http://host.docker.internal/scout-server/api}
-      - XAMPP_SERVER_URL=${XAMPP_SERVER_URL:-http://host.docker.internal/scout-server/api}
+      # Railway bot -> Render server: set SERVER_URL in Railway env, e.g. https://scout-server-nm2m.onrender.com/api
+      - SERVER_URL=${SERVER_URL:-}
+      - SCOUT_SERVER_URL=${SCOUT_SERVER_URL:-}
+      - XAMPP_SERVER_URL=${XAMPP_SERVER_URL:-}
       - BOT_TOKEN=${BOT_TOKEN:-scout-secret}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     restart: unless-stopped
