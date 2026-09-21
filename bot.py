@@ -89,6 +89,7 @@ STATES = [
     "test_numbers_my_verified",
     "test_numbers_my_promoted",
     "test_numbers_sim_dropdown",
+    "sims_onboarding",
     "sims_page",
     "add_sim_select_plan",
     "scoutquest_my_submissions",
@@ -270,6 +271,7 @@ class SiteBot:
             "terms_scout_addendum": self.do_terms_scout_addendum,
             "terms_runner_addendum": self.do_terms_runner_addendum,
             "terms_privacy": self.do_terms_privacy,
+            "sims_onboarding": self.do_sims_onboarding,
             "scout_dashboard": self.do_scout_dashboard,
             "test_numbers_available": self.do_test_numbers_available,
             "test_numbers_my_verified": self.do_test_numbers_my_verified,
@@ -794,6 +796,8 @@ class SiteBot:
             return "continue_verification"
         if _text_matches(body_text, cfg.TRIGGERS["call_result_label"]):
             return "call_result"
+        if _text_matches(body_text, "Welcome to the Scout Role"):
+            return "sims_onboarding"
         if _text_matches(body_text, "SIM Management") and _text_matches(body_text, "Total SIMs"):
             return "sims_page"
         if _text_matches(body_text, "Select an approved call plan"):
@@ -1583,6 +1587,34 @@ class SiteBot:
 
     def do_test_numbers_sim_dropdown(self):
         log("STATE: test_numbers_sim_dropdown", "info")
+        return True
+
+    def do_sims_onboarding(self):
+        log("STATE: sims_onboarding - Welcome to the Scout Role", "info")
+        # This screen pops up mostly on first visit to SIMs page - hit Start -> goes to package, then back to sims to count
+        btn = self.find_button_with_text("Start")
+        # prefer the teal bottom Start button (has arrow) - find_button_with_text will find it
+        if btn is None:
+            # fallback: find any button containing Start
+            for b in self.driver.find_elements(By.TAG_NAME, "button"):
+                try:
+                    if "Start" in (b.text or ""):
+                        btn = b
+                        break
+                except StaleElementReferenceException:
+                    continue
+        if btn is None:
+            log("sims_onboarding: Start button not found", "warn")
+            return False
+        self.click(btn, label="Start")
+        time.sleep(2)
+        # After Start it navigates to package (Select a Plan) - go back to sims to count
+        log("sims_onboarding: clicked Start, navigating back to sims to count", "info")
+        try:
+            self.driver.get(cfg.SIMS_PAGE_URL)
+            time.sleep(2)
+        except Exception as e:
+            log(f"sims_onboarding: failed to navigate back to sims: {e}", "warn")
         return True
 
     def do_sims_page(self):
