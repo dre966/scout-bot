@@ -1424,26 +1424,31 @@ class SiteBot:
 
     def do_resume_test(self):
         log("STATE: resume_test - Finish your current test first", "info")
-        btn = self.find_button_with_text(cfg.TRIGGERS["resume_test_button"])
-        if btn is None:
-            log("resume_test: primary button not found, trying fallback 'Resume'", "warn")
-            btn = self.find_button_with_text("Resume")
-        if btn is not None:
-            log(f"resume_test: clicking '{btn.text[:40]}'", "info")
-            clicked = self.click(btn, label=cfg.TRIGGERS["resume_test_button"])
-            log(f"resume_test: click result={clicked}", "info")
-            time.sleep(1.5)
-            return True
-        log("resume_test: Resume test button not found", "warn")
-        # fallback: try via JS click on any button containing Resume
+        # try JS click first (most reliable for this modal)
         try:
-            js = "var b=document.querySelectorAll('button');for(var i=0;i<b.length;i++){if(b[i].textContent.includes('Resume')){b[i].click();return true;}}return false;"
-            if self.driver.execute_script(js):
-                log("resume_test: JS fallback click succeeded", "ok")
-                time.sleep(1.5)
+            js = "var b=document.querySelectorAll('button');for(var i=0;i<b.length;i++){if(b[i].textContent.trim()==='Resume test' || b[i].textContent.includes('Resume test')){b[i].scrollIntoView({block:'center'});b[i].click();return b[i].textContent.trim();}}return null;"
+            res = self.driver.execute_script(js)
+            if res:
+                log(f"resume_test: JS clicked '{res}'", "ok")
+                time.sleep(3)
                 return True
         except Exception as e:
-            log(f"resume_test JS fallback failed: {e}", "warn")
+            log(f"resume_test: JS click failed: {e}", "warn")
+        btn = self.find_button_with_text(cfg.TRIGGERS["resume_test_button"])
+        if btn is None:
+            btn = self.find_button_with_text("Resume")
+        if btn is not None:
+            log(f"resume_test: clicking '{btn.text[:40]}' via Selenium", "info")
+            clicked = self.click(btn, label=cfg.TRIGGERS["resume_test_button"])
+            log(f"resume_test: click result={clicked}", "info")
+            time.sleep(3)
+            return True
+        log("resume_test: button not found, refreshing", "warn")
+        try:
+            self.driver.refresh()
+            time.sleep(2)
+        except Exception:
+            pass
         return True
 
     def do_verification_ended(self):
