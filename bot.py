@@ -3057,19 +3057,40 @@ class SiteBot:
                             except Exception as e:
                                 err_msg = str(e)
                             if wait_s > 0:
-                                log(f"[cmd] LOGOUT sleeping {wait_s}s before re-login", "info")
-                                # heartbeat still runs via tick? we block here, so sleep in chunks to keep logs visible
+                                log(f"[cmd] LOGOUT sleeping {wait_s}s before re-login (send WAKE to interrupt)", "info")
                                 slept = 0
+                                woken = False
                                 while slept < wait_s:
                                     chunk = min(5, wait_s - slept)
                                     time.sleep(chunk)
                                     slept += chunk
+                                    # poll for WAKE to interrupt sleep
+                                    try:
+                                        url = f"{SERVER_URL.rstrip('/')}/command.php"
+                                        r = requests.get(url, params={"bot_id": BOT_ID}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                                        if r.ok:
+                                            data = r.json()
+                                            for w in (data.get("commands") or []):
+                                                if str(w.get("cmd","")).strip().lower() in ("wake","wakeup","resume","wake_up"):
+                                                    wid = w.get("id")
+                                                    try:
+                                                        ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                                                        requests.post(ack_url, json={"command_id": wid, "status": "done", "bot_id": BOT_ID, "message": "woke from LOGOUT"}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                                                    except: pass
+                                                    log(f"[cmd] WAKE received after {slept}s, interrupting {wait_s}s sleep", "ok")
+                                                    woken = True
+                                                    break
+                                        if woken: break
+                                    except: pass
                                 try:
                                     self.driver.get(cfg.BASE_URL)
                                     time.sleep(1.5)
                                 except Exception:
                                     pass
-                                log(f"[cmd] LOGOUT wait done, at {cfg.BASE_URL} -> login flow resumes", "ok")
+                                if woken:
+                                    log(f"[cmd] LOGOUT woken early at {slept}s -> {cfg.BASE_URL}", "ok")
+                                else:
+                                    log(f"[cmd] LOGOUT wait done, at {cfg.BASE_URL} -> login flow resumes", "ok")
                             else:
                                 log("[cmd] LOGOUT immediate re-login", "ok")
                             # reset per-session state so next login is clean
@@ -3084,6 +3105,48 @@ class SiteBot:
                             requests.post(ack_url, json={"command_id": cmd_id, "status": status, "bot_id": BOT_ID, "message": f"logout wait={wait_s}s" + (f" err={err_msg}" if err_msg else "")}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
                         except Exception:
                             pass
+                    elif cmd_lower in ("wake","wakeup","wake_up"):
+                        log("[cmd] WAKE (no sleep to interrupt) - acked", "ok")
+                        try:
+                            ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                            requests.post(ack_url, json={"command_id": cmd_id, "status": "done", "bot_id": BOT_ID, "message": "wake acked"}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                        except: pass
+                    elif cmd_lower in ("sleep","pause"):
+                        # SLEEP is alias to LOGOUT with wait; args wait
+                        wait_s = 0
+                        try:
+                            if args:
+                                raw_wait = args.get("wait", args.get("wait_seconds", args.get("delay", args.get("sleep", 0))))
+                                wait_s = int(float(str(raw_wait).strip() or 0)) if raw_wait is not None else 0
+                        except: wait_s = 0
+                        wait_s = max(0, min(wait_s, 86400))
+                        log(f"[cmd] SLEEP wait={wait_s}s", "info")
+                        # reuse same wakeable sleep
+                        slept = 0
+                        woken = False
+                        while slept < wait_s:
+                            chunk = min(5, wait_s - slept)
+                            time.sleep(chunk)
+                            slept += chunk
+                            try:
+                                url = f"{SERVER_URL.rstrip('/')}/command.php"
+                                r = requests.get(url, params={"bot_id": BOT_ID}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                                if r.ok:
+                                    for w in (r.json().get("commands") or []):
+                                        if str(w.get("cmd","")).strip().lower() in ("wake","wakeup","resume"):
+                                            wid = w.get("id")
+                                            try:
+                                                ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                                                requests.post(ack_url, json={"command_id": wid, "status": "done", "bot_id": BOT_ID, "message": "woke from SLEEP"}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                                            except: pass
+                                            woken=True; break
+                                if woken: break
+                            except: pass
+                        try:
+                            ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                            requests.post(ack_url, json={"command_id": cmd_id, "status": "done", "bot_id": BOT_ID, "message": f"sleep {wait_s}s {'woken' if woken else 'done'}"}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                        except: pass
+                        if woken: log(f"[cmd] SLEEP woken at {slept}s", "ok")
                     else:
                         # generic commands (PAUSE etc.) - ack as acked, let state handlers deal if needed
                         try:
