@@ -1494,6 +1494,32 @@ class SiteBot:
 
         body_text = self.get_body_text()
 
+        # If onboarding modal is showing on first visit, handle it before counting
+        if _text_matches(body_text, "Welcome to the Scout Role"):
+            log("scout_dashboard: onboarding modal detected on sims page, clicking Start", "info")
+            btn = self.find_button_with_text("Start")
+            if btn is None:
+                for b in self.driver.find_elements(By.TAG_NAME, "button"):
+                    try:
+                        if "Start" in (b.text or ""):
+                            btn = b
+                            break
+                    except StaleElementReferenceException:
+                        continue
+            if btn is not None:
+                self.click(btn, label="Start")
+                time.sleep(2)
+                try:
+                    self.driver.get(cfg.SIMS_PAGE_URL)
+                    time.sleep(2)
+                    body_text = self.get_body_text()
+                except Exception as e:
+                    log(f"scout_dashboard: failed to navigate back after onboarding: {e}", "warn")
+                    return False
+            else:
+                log("scout_dashboard: onboarding Start button not found", "warn")
+                return False
+
         # --- Detection: parse "Total SIMs N" ---
         sim_count = None
         m = re.search(r"Total SIMs\s*(\d+)", body_text, re.IGNORECASE)
@@ -1558,9 +1584,20 @@ class SiteBot:
 
         # SIMs present
         display_count = sim_count if sim_count is not None else (card_count or phone_count or 1)
-        # If sim_count is None but we have evidence of SIMs, ensure we log at least 1
+        # If sim_count is None but we have no cards/phones, this is likely 0 sims or parsing failure
+        # On sims page with onboarding already handled, 0 cards means truly 0 sims, not unknown present
         if sim_count is None and card_count == 0 and phone_count == 0:
-            # No explicit count but not zero - could be parsing failure; treat as unknown but >0
+            # Check if we're still on sims page and not in a transient state
+            if _text_matches(body_text, "SIM Management") or _text_matches(body_text, "Add SIM") or _text_matches(body_text, "Total SIMs"):
+                # Treat as 0 sims - will be caught by is_zero logic above, but if we reach here it means has_no_sims_text was false
+                # Log as 0 for accuracy
+                log(f"SIM check: 0 sims found (could not parse count, card_count={card_count} phone_count={phone_count})", "warn")
+                msg = f"No SIMs registered for {self.current_sim or 'unknown'} - check dashboard"
+                try:
+                    self.log.error(msg, details={"sim": self.current_sim, "sim_count": 0, "card_count": card_count, "phone_count": phone_count, "url": cfg.SIMS_PAGE_URL})
+                except Exception:
+                    pass
+                raise NoSimsRegistered(msg)
             display_count = "?"
             log(f"SIM check: sims present (could not parse count, card_count={card_count} phone_count={phone_count})", "ok")
         else:
@@ -1812,12 +1849,15 @@ def run():
             bot.running = False
         except NoSimsRegistered as e:
             # Custom exception: 0 SIMs on dashboard - server will pick up and notify
+            # Don't crash chrome - just log and keep bot alive (sleep 60s then continue so server can poll)
             log(f"NoSimsRegistered: {e}", "error")
             try:
                 bot.log.error(f"NoSimsRegistered: {e}", details={"sim": getattr(bot, "current_sim", None), "url": getattr(bot.driver, "current_url", "")})
             except Exception:
                 pass
-            raise SystemExit(str(e))
+            # Keep chrome open, sleep and retry (server can detect via logs)
+            time.sleep(60)
+            continue
         except SystemExit as e:
             log(f"Exit: {e}", "warn")
             break
