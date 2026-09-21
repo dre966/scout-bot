@@ -2455,14 +2455,26 @@ class SiteBot:
     def do_test_numbers_available(self):
         log("STATE: test_numbers_available", "info")
         if getattr(cfg, "API_PAIRING", False):
+            ok = False
             try:
-                self.api_pair_session()
+                ok = self.api_pair_session()
             except Exception as e:
                 log(f"api_pair_session failed: {e}", "warn")
                 try:
                     self.step_click_test_number(self.find_test_number_rows())
+                    ok = True
                 except Exception as e2:
                     log(f"step_click fallback failed: {e2}", "warn")
+            if not ok:
+                # All 8/8 or no pairs -> already emitted NoNumbersToTest high in api_pair; break loop by returning to dashboard for fresh SIM check
+                log("test_numbers_available: no pair created -> back to dashboard for SIM re-check (throttle 15s)", "warn")
+                time.sleep(15)
+                try:
+                    self.driver.get(cfg.BASE_URL + "/scout")
+                    time.sleep(2)
+                except Exception:
+                    pass
+                return True
         else:
             try:
                 rows = self.find_test_number_rows()
