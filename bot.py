@@ -2711,6 +2711,106 @@ class SiteBot:
                             requests.post(ack_url, json={"command_id": cmd_id, "status": "done", "bot_id": BOT_ID, "message": "refreshed"}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
                         except Exception:
                             pass
+                    elif cmd_lower in ("logout", "log_out", "signout", "sign_out"):
+                        # Dashboard sends {wait, wait_seconds, delay, sleep} - seconds to idle before re-login
+                        wait_s = 0
+                        try:
+                            if args:
+                                raw_wait = args.get("wait", args.get("wait_seconds", args.get("delay", args.get("sleep", 0))))
+                                wait_s = int(float(str(raw_wait).strip() or 0)) if raw_wait is not None else 0
+                        except Exception:
+                            wait_s = 0
+                        wait_s = max(0, min(wait_s, 86400))
+                        log(f"[cmd] LOGOUT wait={wait_s}s -> logging out", "info")
+                        err_msg = None
+                        try:
+                            # Try UI Sign Out via profile menu (most reliable)
+                            signed_out = False
+                            try:
+                                # open profile dropdown (reuse _switch logic: find profile button)
+                                profile_btn = None
+                                for btn in self.driver.find_elements(By.TAG_NAME, "button"):
+                                    try:
+                                        html = (btn.get_attribute("innerHTML") or "")
+                                        txt = (btn.text or "") + (btn.get_attribute("innerText") or "")
+                                        if "chevrons-up-down" in html or ("@" in txt and ("Scout" in txt or "Runner" in txt)):
+                                            profile_btn = btn
+                                            break
+                                    except StaleElementReferenceException:
+                                        continue
+                                if profile_btn is None:
+                                    cands = self.driver.find_elements(By.CSS_SELECTOR, "button.w-full.flex.items-center.gap-2")
+                                    if cands:
+                                        profile_btn = cands[0]
+                                if profile_btn is not None:
+                                    try:
+                                        self.click(profile_btn, label="profile menu for logout")
+                                        time.sleep(1)
+                                    except Exception:
+                                        try:
+                                            self.driver.execute_script("arguments[0].click();", profile_btn)
+                                            time.sleep(1)
+                                        except Exception:
+                                            pass
+                                    sign_btn = self.find_button_with_text("Sign Out")
+                                    if sign_btn is None:
+                                        sign_btn = self.find_button_with_text("Log Out")
+                                    if sign_btn is None:
+                                        sign_btn = self.find_button_with_text("Logout")
+                                    if sign_btn is not None:
+                                        log("[cmd] LOGOUT clicking Sign Out", "info")
+                                        self.click(sign_btn, label="Sign Out")
+                                        time.sleep(2)
+                                        signed_out = True
+                                    else:
+                                        log("[cmd] LOGOUT Sign Out button not found after opening menu", "warn")
+                                else:
+                                    log("[cmd] LOGOUT profile button not found", "warn")
+                            except Exception as e:
+                                log(f"[cmd] LOGOUT UI attempt failed: {e}", "warn")
+                            # Hard clear: cookies + storage so session is dead even if UI click missed
+                            try:
+                                self.driver.delete_all_cookies()
+                            except Exception:
+                                pass
+                            try:
+                                self.driver.execute_script("try{localStorage.clear()}catch(e){}; try{sessionStorage.clear()}catch(e){}")
+                            except Exception:
+                                pass
+                            # Navigate to landing
+                            try:
+                                self.driver.get(cfg.BASE_URL)
+                                time.sleep(2)
+                            except Exception as e:
+                                err_msg = str(e)
+                            if wait_s > 0:
+                                log(f"[cmd] LOGOUT sleeping {wait_s}s before re-login", "info")
+                                # heartbeat still runs via tick? we block here, so sleep in chunks to keep logs visible
+                                slept = 0
+                                while slept < wait_s:
+                                    chunk = min(5, wait_s - slept)
+                                    time.sleep(chunk)
+                                    slept += chunk
+                                try:
+                                    self.driver.get(cfg.BASE_URL)
+                                    time.sleep(1.5)
+                                except Exception:
+                                    pass
+                                log(f"[cmd] LOGOUT wait done, at {cfg.BASE_URL} -> login flow resumes", "ok")
+                            else:
+                                log("[cmd] LOGOUT immediate re-login", "ok")
+                            # reset per-session state so next login is clean
+                            self.api_token = None
+                            self.current_sim_id = None
+                        except Exception as e:
+                            err_msg = str(e)
+                            log(f"[cmd] LOGOUT failed: {e}", "error")
+                        try:
+                            ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                            status = "done" if not err_msg else "done"
+                            requests.post(ack_url, json={"command_id": cmd_id, "status": status, "bot_id": BOT_ID, "message": f"logout wait={wait_s}s" + (f" err={err_msg}" if err_msg else "")}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                        except Exception:
+                            pass
                     else:
                         # generic commands (PAUSE etc.) - ack as acked, let state handlers deal if needed
                         try:
