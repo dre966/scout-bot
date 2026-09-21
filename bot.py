@@ -1152,17 +1152,21 @@ class SiteBot:
         DOM detection (no side effects).
 
         Priority order (documented):
-        1. Core test-flow critical states (max_sessions -> suspended) - must win over everything.
-        2. Landing + auth/onboarding (landing_page, sign_in_options, email_access,
-           otp_verification, license_select, country_select, role_select/country_role_select,
-           verify_identity, terms_*) - checked early so login flow never hits unknown.
-        3. Modal / overlay states (delete_account_modal, switch_role_modal) - checked early
-           because they overlay other pages; text appears on top of body.
-        4. Core test-flow main loop (test_numbers variants, nothing_to_scout,
-           confirm_session -> call_result) - original 19 STATES priority preserved.
-        5. Extended app pages (scout_dashboard, sims_page, scoutquest, messages,
-           runner pages, settings) - AFTER test-flow so active testing is prioritized.
-        6. unknown fallback.
+        1. Core critical (max_sessions, keep_testing_dialog, already_tested, resume_test,
+           verification_ended, suspended) - must win over everything.
+        2. Landing / no_active_license
+        3. Modals (delete_account_modal, switch_role_modal) - overlay other pages.
+        4. Auth (sign_in_options, email_access, otp_verification, license_select,
+           country_select, role_select, country_role_select, verify_identity,
+           identity_verified, terms_*) - checked early so login flow never hits unknown.
+        5. Core test-flow: test_numbers variants, nothing_to_scout, confirm_session,
+           balance_entry, package_select, select_one, call_completed,
+           verification_complete, call_this_number, continue_verification, call_result
+        6. Extended app pages (scout): scout_dashboard, sims_page, sims_onboarding,
+           add_sim_select_plan, scoutquest, messages - URL-aware, AFTER test-flow.
+        7. Runner pages
+        8. Settings
+        9. unknown fallback.
         """
         body_text = self.get_body_text()
 
@@ -1314,22 +1318,6 @@ class SiteBot:
             return "package_select"
         if _text_matches(body_text, cfg.TRIGGERS["select_one_label"]):
             return "select_one"
-        # ---- 6. Extended app pages (scout) - MUST be before call_completed
-        # call_completed label "Completed" is too generic (matches "Completed test" on dashboard and "Call Completed" toggle on settings)
-        if _text_matches(body_text, "Scout Dashboard") and _text_matches(body_text, "Start Validating Numbers"):
-            return "scout_dashboard"
-        if _text_matches(body_text, "Scout Dashboard"):
-            return "scout_dashboard"
-        # fallback: dashboard sidebar visible but title not in preview (e.g. after identity verified)
-        if _text_matches(body_text, "Dashboard") and _text_matches(body_text, "Total UPs gained") and _text_matches(body_text, "Test Numbers"):
-            return "scout_dashboard"
-        if _text_matches(body_text, "Settings") and _text_matches(body_text, "Delete Account"):
-            return "settings_page"
-        if _text_matches(body_text, "Runner Settings") or _text_matches(body_text, "Manage your runner profile"):
-            return "settings_page"
-        if _text_matches(body_text, "Scout Settings") or _text_matches(body_text, "Manage your scout profile"):
-            return "settings_page"
-
         if _text_matches(body_text, cfg.TRIGGERS["call_completed_label"]):
             # tighten: real call_completed page has "Call X of 5 Completed", not just "Completed"
             if re.search(r"Call\s*\d+\s*of\s*5", body_text, re.IGNORECASE):
@@ -1347,12 +1335,25 @@ class SiteBot:
             return "continue_verification"
         if _text_matches(body_text, cfg.TRIGGERS["call_result_label"]):
             return "call_result"
+
+        # ---- 6. Extended app pages (scout) - AFTER core test-flow so active testing is prioritized ----
+        # URL-aware to avoid sidebar "Dashboard" false positives on every scout page
+        try:
+            url = self.driver.current_url or ""
+        except:
+            url = ""
+        if "/scout" in url and url.rstrip("/").endswith("/scout") and _text_matches(body_text, "Scout Dashboard"):
+            return "scout_dashboard"
+        if "/scout" in url and _text_matches(body_text, "Start Validating Numbers"):
+            return "scout_dashboard"
+        if "/scout" in url and _text_matches(body_text, "Scout Dashboard") and _text_matches(body_text, "Tests Today"):
+            return "scout_dashboard"
+        if "/scout/sims" in url and _text_matches(body_text, "SIM Management") and _text_matches(body_text, "Total SIMs"):
+            return "sims_page"
+        if "/scout/sims" in url and _text_matches(body_text, "Select an approved call plan"):
+            return "add_sim_select_plan"
         if _text_matches(body_text, "Welcome to the Scout Role"):
             return "sims_onboarding"
-        if _text_matches(body_text, "SIM Management") and _text_matches(body_text, "Total SIMs"):
-            return "sims_page"
-        if _text_matches(body_text, "Select an approved call plan"):
-            return "add_sim_select_plan"
         if _text_matches(body_text, "ScoutQuest Results"):
             return "scoutquest_results"
         if _text_matches(body_text, "ScoutQuest") and _text_matches(body_text, "My Submissions"):
@@ -1401,7 +1402,13 @@ class SiteBot:
         if _text_matches(body_text, "My SIMs"):
             return "runner_sims_page"
 
-        # ---- 8. Settings (already handled above before call_completed, kept here as fallback) ----
+        # ---- 8. Settings ----
+        if _text_matches(body_text, "Settings") and _text_matches(body_text, "Delete Account"):
+            return "settings_page"
+        if _text_matches(body_text, "Runner Settings") or _text_matches(body_text, "Manage your runner profile"):
+            return "settings_page"
+        if _text_matches(body_text, "Scout Settings") or _text_matches(body_text, "Manage your scout profile"):
+            return "settings_page"
 
         # ---- 9. unknown (fallback) ----
         preview = body_text[:120].replace("\n", " ") if body_text else ""
