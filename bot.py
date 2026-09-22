@@ -1788,13 +1788,21 @@ class SiteBot:
         log("STATE: call_result")
         self.show_progress()
         body_text = self.get_body_text()
-        if "voicemail" in body_text.lower():
-            log("Voicemail detected on result page — going back to retry", "warn")
+        low = body_text.lower()
+        if "voicemail" in low or "connected to ivr" in low:
+            kind = "Voicemail" if "voicemail" in low else "Connected To IVR"
+            log(f"{kind} detected on result page — going back to retry", "warn")
             btn = self.find_button_with_text("Back")
             if btn:
                 self.click(btn, label="Back", testing_mode=True)
             else:
-                self.driver.back()
+                try:
+                    # JS fallback for portal Back
+                    js = "var b=document.querySelectorAll('button');for(var i=0;i<b.length;i++){if(b[i].textContent.trim()==='Back'){b[i].click();return true;}} return false;"
+                    if not self.driver.execute_script(js):
+                        self.driver.back()
+                except:
+                    self.driver.back()
             time.sleep(1.5)
             return
         input_el = self.driver.find_elements(By.CSS_SELECTOR, "input[type='number']")
