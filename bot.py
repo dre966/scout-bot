@@ -3306,6 +3306,38 @@ class SiteBot:
 
     # -- tick dispatcher (two-phase) ---------------------------------------
 
+    def _check_stuck_slots(self, state):
+        # pings slots left (state + sims_count + url) and notifies if stuck > threshold
+        try:
+            slots = getattr(self, "stored_verification_count", 0)
+            cur = (state, slots, getattr(self.driver, "current_url", "")[:80] if hasattr(self.driver, "current_url") else "")
+            now = time.time()
+            last = getattr(self, "_last_slots", None)
+            last_t = getattr(self, "_last_slots_time", 0)
+            thresh = float(os.getenv("STUCK_THRESHOLD", "300"))  # 5 min default
+            # ntfy high every thresh, with backoff
+            if last != cur:
+                self._last_slots = cur
+                self._last_slots_time = now
+                self._stuck_notified = False
+            elif now - last_t > thresh and not getattr(self, "_stuck_notified", False):
+                msg = f"Stuck {int(now-last_t)}s on {state} slots={slots} url={(cur[2][:60] if len(cur)>2 else '')}"
+                log(f"STUCK: {msg} — notifying", "warn")
+                try:
+                    _post_to_server("notify.php", {
+                        "bot_id": BOT_ID,
+                        "type": "StuckSlots",
+                        "message": msg,
+                        "details": {"state": state, "slots": slots, "url": cur[2] if len(cur)>2 else "", "threshold": thresh},
+                        "priority": "high"
+                    })
+                except: pass
+                self._stuck_notified = True
+                # reset timer so next notify after another thresh
+                self._last_slots_time = now
+        except Exception as e:
+            log(f"stuck check failed: {e}", "warn")
+
     def tick(self):
         # Poll server commands first (non-blocking, every ~2.5s)
         try:
@@ -3314,7 +3346,7 @@ class SiteBot:
             log(f"poll_commands exception: {e}", "warn")
         state = self.identify_state()
         log(f"[state] {state}")
-        # heartbeat to XAMPP comms server (silent fail so bot never dies if XAMPP down)
+        # heartbeat to comms server (silent fail so bot never dies if server down)
         try:
             _proxy = getattr(self, "noted_proxy", None) or getattr(self, "proxy_email", None)
             _poll = getattr(self, "poll_inbox", None)
@@ -3333,6 +3365,10 @@ class SiteBot:
             })
         except Exception as e:
             log(f"heartbeat post failed: {e}", "warn")
+        # slots watchdog — pings amount of slots left, notifies if stuck too long
+        try:
+            self._check_stuck_slots(state)
+        except: pass
         handler = self.STATE_HANDLERS.get(state, self.do_unknown)
         return handler()
 
