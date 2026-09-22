@@ -3064,15 +3064,21 @@ class SiteBot:
                                     chunk = min(5, wait_s - slept)
                                     time.sleep(chunk)
                                     slept += chunk
-                                    # poll for WAKE to interrupt sleep
+                                    # poll for WAKE or REGISTER_UI to interrupt sleep
                                     try:
                                         url = f"{SERVER_URL.rstrip('/')}/command.php"
                                         r = requests.get(url, params={"bot_id": BOT_ID}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
                                         if r.ok:
                                             data = r.json()
                                             for w in (data.get("commands") or []):
-                                                if str(w.get("cmd","")).strip().lower() in ("wake","wakeup","resume","wake_up"):
+                                                low = str(w.get("cmd","")).strip().lower()
+                                                if low in ("wake","wakeup","resume","wake_up","register_ui","register-ui","register_via_ui"):
                                                     wid = w.get("id")
+                                                    # don't ack REGISTER_UI here, let main loop handle it; just wake
+                                                    if low.startswith("register"):
+                                                        log(f"[cmd] REGISTER_UI queued, interrupting sleep after {slept}s", "ok")
+                                                        woken = True
+                                                        break
                                                     try:
                                                         ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
                                                         requests.post(ack_url, json={"command_id": wid, "status": "done", "bot_id": BOT_ID, "message": "woke from LOGOUT"}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
@@ -3133,8 +3139,12 @@ class SiteBot:
                                 r = requests.get(url, params={"bot_id": BOT_ID}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
                                 if r.ok:
                                     for w in (r.json().get("commands") or []):
-                                        if str(w.get("cmd","")).strip().lower() in ("wake","wakeup","resume"):
+                                        low=str(w.get("cmd","")).strip().lower()
+                                        if low in ("wake","wakeup","resume","register_ui","register-ui","register_via_ui"):
                                             wid = w.get("id")
+                                            if low.startswith("register"):
+                                                log(f"[cmd] REGISTER_UI queued, waking SLEEP after {slept}s", "ok")
+                                                woken=True; break
                                             try:
                                                 ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
                                                 requests.post(ack_url, json={"command_id": wid, "status": "done", "bot_id": BOT_ID, "message": "woke from SLEEP"}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
@@ -3147,6 +3157,122 @@ class SiteBot:
                             requests.post(ack_url, json={"command_id": cmd_id, "status": "done", "bot_id": BOT_ID, "message": f"sleep {wait_s}s {'woken' if woken else 'done'}"}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
                         except: pass
                         if woken: log(f"[cmd] SLEEP woken at {slept}s", "ok")
+                    elif cmd_lower in ("register_ui","register-ui","register_via_ui","register via ui"):
+                        log("[cmd] REGISTER_UI via browser", "info")
+                        try:
+                            # ensure runner role
+                            try: self._switch_to_runner()
+                            except: pass
+                            # get sims list from args or from server sims.json via fallback
+                            sims = (args.get("sims") if isinstance(args, dict) else None) or []
+                            if not sims:
+                                # try to fetch via server
+                                try:
+                                    jd = _get_from_server(f"sims.json?bot_id={BOT_ID}")
+                                    # fallback: try to load local sims.json if available
+                                except: pass
+                            # if still empty, try local file
+                            if not sims:
+                                try:
+                                    import json as _js
+                                    with open("data/sims.json","r") as f:
+                                        data=_js.load(f)
+                                        sims=data.get(str(BOT_ID)) or data.get(f"acc{BOT_ID}") or []
+                                        # normalize to phone list
+                                        if sims and isinstance(sims[0], dict):
+                                            sims=[s.get("phoneNumber") or s.get("phone") for s in sims]
+                                except: pass
+                            if not sims:
+                                log("REGISTER_UI: no sims list", "warn")
+                            else:
+                                for phone in sims:
+                                    if isinstance(phone, dict): phone=phone.get("phoneNumber") or phone.get("phone")
+                                    if not phone: continue
+                                    log(f"REGISTER_UI: adding {phone}", "info")
+                                    try:
+                                        self.driver.get("https://scoutandrunner.com/runner/sims/add")
+                                        time.sleep(2)
+                                        # fill phone
+                                        inp=None
+                                        for sel in ['input[type="tel"]','input[placeholder*="phone" i]','input[name*="phone" i]','input']:
+                                            try:
+                                                els=self.driver.find_elements(By.CSS_SELECTOR, sel)
+                                                for el in els:
+                                                    try:
+                                                        if el.is_displayed() and el.is_enabled():
+                                                            inp=el; break
+                                                    except: continue
+                                                if inp: break
+                                            except: continue
+                                        if inp:
+                                            self.type_into(inp, phone, label="phone")
+                                            time.sleep(0.6)
+                                        # carrier/country may be auto, try to find carrier input
+                                        # Click Add/Submit
+                                        btn=self.find_button_with_text("Add SIM") or self.find_button_with_text("Add") or self.find_button_with_text("Submit") or self.find_button_with_text("Continue")
+                                        if btn:
+                                            self.click(btn, label="Add SIM")
+                                            time.sleep(3)
+                                            # handle OTP if appears
+                                            # try to fetch OTP via esimplus
+                                            try:
+                                                from utils.otp import fetch_otp_for_bot
+                                            except: fetch_otp_for_bot=None
+                                            # wait for OTP input
+                                            otp_inp=None
+                                            for _ in range(8):
+                                                try:
+                                                    otp_inp=self.driver.find_element(By.CSS_SELECTOR, 'input[placeholder*="OTP" i], input[name*="otp" i], input[maxlength="6"]')
+                                                    if otp_inp and otp_inp.is_displayed(): break
+                                                except: pass
+                                                time.sleep(1)
+                                            if otp_inp:
+                                                # fetch OTP via esimplus (reuse gmail helper? fallback to esimplus)
+                                                code=None
+                                                try:
+                                                    import requests as _req
+                                                    url=f"https://esimplus.me/api/sms-receiver/{phone.lstrip('+')}/sms?perPage=5"
+                                                    for _ in range(6):
+                                                        try:
+                                                            r=_req.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+                                                            if r.ok:
+                                                                j=r.json()
+                                                                arr=j.get("data") or j.get("messages") or []
+                                                                if arr:
+                                                                    txt=arr[0].get("body") or arr[0].get("message") or ""
+                                                                    import re as _re
+                                                                    m=_re.search(r"\d{4,8}", txt)
+                                                                    if m: code=m.group(); break
+                                                        except: pass
+                                                        time.sleep(5)
+                                                except: pass
+                                                if code:
+                                                    self.type_into(otp_inp, code, label="otp")
+                                                    time.sleep(0.5)
+                                                    vbtn=self.find_button_with_text("Verify") or self.find_button_with_text("Submit")
+                                                    if vbtn: self.click(vbtn, label="Verify OTP"); time.sleep(2)
+                                            # check for success / already / too many
+                                            body=self.get_body_text().lower()
+                                            if "already" in body:
+                                                log(f"REGISTER_UI {phone} already in list", "warn")
+                                            elif "too many" in body:
+                                                log("REGISTER_UI too many requests, stopping", "warn")
+                                                break
+                                            elif "security" in body:
+                                                log(f"REGISTER_UI {phone} security fail", "warn")
+                                            else:
+                                                log(f"REGISTER_UI {phone} done", "ok")
+                                        else:
+                                            log(f"REGISTER_UI {phone} no Add button", "warn")
+                                    except Exception as e:
+                                        log(f"REGISTER_UI {phone} error: {e}", "warn")
+                                    time.sleep(1.5)
+                        except Exception as e:
+                            log(f"REGISTER_UI failed: {e}", "error")
+                        try:
+                            ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                            requests.post(ack_url, json={"command_id": cmd_id, "status": "done", "bot_id": BOT_ID, "message": "register_ui done"}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                        except: pass
                     else:
                         # generic commands (PAUSE etc.) - ack as acked, let state handlers deal if needed
                         try:
