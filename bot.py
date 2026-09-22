@@ -2745,7 +2745,11 @@ class SiteBot:
         return True
 
     def do_sims_page(self):
-        log("STATE: sims_page", "info")
+        log("STATE: sims_page - bounce to test-numbers (was looping)", "info")
+        try:
+            self.driver.get(cfg.TEST_NUMBERS_PAGE_URL)
+            time.sleep(1.5)
+        except: pass
         return True
 
     def do_add_sim_select_plan(self):
