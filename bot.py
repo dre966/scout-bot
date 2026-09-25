@@ -3386,10 +3386,10 @@ class SiteBot:
 # ---------------------------------------------------------------------------
 
 def _print_create_code(driver):
-    # Print create-code request body for local test — as you asked, just read the body
+    # Print full create-code request body so you see with your eyes (no server roundtrip)
     try:
         logs = driver.get_log("performance")
-        for entry in logs:
+        for entry in reversed(logs):
             try:
                 msg = json.loads(entry.get("message", "{}"))
                 m = msg.get("message", {})
@@ -3398,19 +3398,26 @@ def _print_create_code(driver):
                     url = req.get("url", "")
                     if "create-code" in url:
                         body = req.get("postData", "") or ""
-                        # try to pretty print if JSON
+                        hdrs = req.get("headers", {}) or {}
                         try:
-                            j = json.loads(body) if isinstance(body, str) else {}
+                            j = json.loads(body) if isinstance(body, str) and body else {}
                             pretty = json.dumps(j, indent=2)
                         except:
                             pretty = body
-                        print(f"[create-code] {url}\n{pretty}")
-                        log(f"create-code captured {url} body {pretty[:300]}", "ok")
+                        # full dump to stdout + log
+                        out = f"[create-code] {url}\nHeaders: {json.dumps(hdrs, indent=2)}\nBody:\n{pretty}"
+                        print(out)
+                        # also log in chunks so VNC log shows it
+                        for i in range(0, len(pretty), 600):
+                            log(f"create-code body chunk {i//600}: {pretty[i:i+600]}", "ok")
+                        log(f"create-code captured {url} ({len(pretty)} chars)", "ok")
                         return
             except: continue
-        log("create-code not found in perf logs", "warn")
+        log("create-code not found in perf logs (try hitting Continue again)", "warn")
+        print("[create-code] not found — check Network logs manually")
     except Exception as e:
         log(f"print_create_code failed {e}", "warn")
+        print(f"[create-code] failed {e}")
 
 def connect_to_chrome(port=None):
     if port is None:
