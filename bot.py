@@ -2296,10 +2296,18 @@ class SiteBot:
         log(f"license_select: clicking Continue '{cont_btn.text[:30] if cont_btn else ''}'", "info")
         if self.click(cont_btn, label="license_continue"):
             time.sleep(1.5)
+            try:
+                time.sleep(0.8)
+                _print_create_code(self.driver)
+            except: pass
             return True
         try:
             self.driver.execute_script("arguments[0].click();", cont_btn)
             time.sleep(1.5)
+            try:
+                time.sleep(0.8)
+                _print_create_code(self.driver)
+            except: pass
             return True
         except Exception as e:
             log(f"license_select: Continue click failed: {e}", "error")
@@ -3377,20 +3385,46 @@ class SiteBot:
 # Chrome / tab helpers
 # ---------------------------------------------------------------------------
 
+def _print_create_code(driver):
+    # Print create-code request body for local test — as you asked, just read the body
+    try:
+        logs = driver.get_log("performance")
+        for entry in logs:
+            try:
+                msg = json.loads(entry.get("message", "{}"))
+                m = msg.get("message", {})
+                if m.get("method") == "Network.requestWillBeSent":
+                    req = m.get("params", {}).get("request", {})
+                    url = req.get("url", "")
+                    if "create-code" in url:
+                        body = req.get("postData", "") or ""
+                        # try to pretty print if JSON
+                        try:
+                            j = json.loads(body) if isinstance(body, str) else {}
+                            pretty = json.dumps(j, indent=2)
+                        except:
+                            pretty = body
+                        print(f"[create-code] {url}\n{pretty}")
+                        log(f"create-code captured {url} body {pretty[:300]}", "ok")
+                        return
+            except: continue
+        log("create-code not found in perf logs", "warn")
+    except Exception as e:
+        log(f"print_create_code failed {e}", "warn")
+
 def connect_to_chrome(port=None):
-    # Try debuggerAddress first (for manual chrome), fallback to launching new chrome
     if port is None:
         try:
             port = int(os.environ.get("CHROME_PORT", os.environ.get("DEBUGGER_PORT", "")) or getattr(cfg, "DEBUGGER_PORT", getattr(cfg, "CHROME_DEBUG_PORT", 9222)))
         except Exception:
             port = 9222
-
-    # Attempt 1: connect to existing chrome on debugger port
+    chromedriver_path = getattr(cfg, "CHROMEDRIVER_PATH", None)
+    # Attempt 1: existing chrome
     opts_dbg = Options()
     opts_dbg.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
     opts_dbg.add_argument("--no-sandbox")
     opts_dbg.add_argument("--disable-dev-shm-usage")
-    chromedriver_path = getattr(cfg, "CHROMEDRIVER_PATH", None)
+    opts_dbg.set_capability("goog:loggingPrefs", {"performance": "ALL"})
     try:
         if chromedriver_path and os.path.exists(chromedriver_path):
             service = Service(executable_path=chromedriver_path)
@@ -3398,11 +3432,15 @@ def connect_to_chrome(port=None):
         else:
             driver = webdriver.Chrome(options=opts_dbg)
         log(f"Connected to existing Chrome on port {port}", "ok")
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
+        except: pass
+        try: _inject_license_hook(driver)
+        except: pass
         return driver
     except WebDriverException as e:
         log(f"No existing Chrome on port {port}: {e} — launching new Chrome", "warn")
-
-    # Attempt 2: launch new chrome directly (visible via Xvfb DISPLAY=:99)
+    # Attempt 2: new chrome
     opts = Options()
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -3411,7 +3449,7 @@ def connect_to_chrome(port=None):
     opts.add_argument("--remote-allow-origins=*")
     opts.add_argument("--no-first-run")
     opts.add_argument("--disable-extensions")
-    # ensure we use a fresh profile
+    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
     opts.add_argument("--user-data-dir=/tmp/chrome-bot-profile")
     try:
         if chromedriver_path and os.path.exists(chromedriver_path):
@@ -3420,6 +3458,11 @@ def connect_to_chrome(port=None):
         else:
             driver = webdriver.Chrome(options=opts)
         log(f"Launched new Chrome (visible via VNC :99)", "ok")
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
+        except: pass
+        try: _inject_license_hook(driver)
+        except: pass
         return driver
     except WebDriverException as e:
         log(f"Failed to launch Chrome: {e}", "error")
