@@ -2581,9 +2581,28 @@ class SiteBot:
         walk(j)
         return bool(lists) and all(len(l) == 0 for l in lists)
 
+    def _lic_do_refresh(self):
+        """Click the Refresh button; fall back to reloading the page."""
+        if self._click_license_refresh():
+            return True
+        try:
+            log("no_active_license: no refresh button — reloading page (hook is CDP-registered)", "info")
+            self.driver.refresh()
+            time.sleep(3)
+            if getattr(self, "_lic_force", False):
+                self.driver.execute_script("window.__licForceFalse = true;")
+            self._click_license_refresh()
+            return True
+        except Exception as e:
+            log(f"no_active_license: reload failed: {e}", "warn")
+            return False
+
     def do_no_active_license(self):
         log("STATE: no_active_license", "warn")
         if getattr(self, "_lic_no_data", False):
+            if time.time() - getattr(self, "_lic_last_hb", 0) > 30:
+                self._lic_last_hb = time.time()
+                log("no_active_license: API confirmed no licenses for this account — idling", "warn")
             time.sleep(1)
             return False
         now = time.time()
@@ -2592,17 +2611,30 @@ class SiteBot:
             return False
         self._lic_refresh_ts = now
         _inject_license_hook(self.driver)
-        clicked = self._click_license_refresh()
-        if not clicked:
+
+        if not getattr(self, "_lic_force", False):
+            # Stage 1: normal query (isBound:true) — a bound license must show up unmodified.
+            self._lic_do_refresh()
+            time.sleep(2.5)
+            resp = self._log_license_hook("no_active_license:isBound=true")
+            if resp and resp != "none" and not self._resp_is_empty(resp):
+                log("no_active_license: API returned licenses with isBound:true — waiting for UI to render", "info")
+                return True
+            # Stage 2: natural response empty → retry with isBound:false.
+            self._lic_force = True
             try:
-                log("no_active_license: no refresh button — reloading page (hook is CDP-registered)", "info")
-                self.driver.refresh()
-                time.sleep(3)
-                clicked = self._click_license_refresh()
+                self.driver.execute_script("window.__licForceFalse = true;")
             except Exception as e:
-                log(f"no_active_license: reload failed: {e}", "warn")
-        time.sleep(2.5)
-        resp = self._log_license_hook("no_active_license")
+                log(f"no_active_license: force flag failed: {e}", "warn")
+            log("no_active_license: empty with isBound:true — flipping request to isBound:false", "warn")
+            self._lic_do_refresh()
+            time.sleep(2.5)
+            resp = self._log_license_hook("no_active_license:isBound=false")
+        else:
+            self._lic_do_refresh()
+            time.sleep(2.5)
+            resp = self._log_license_hook("no_active_license:isBound=false")
+
         if self._resp_is_empty(resp):
             n = getattr(self, "_lic_empty", 0) + 1
             self._lic_empty = n
@@ -2623,10 +2655,12 @@ class SiteBot:
         try:
             hits = self.driver.execute_script("return window.__licHits || 0")
             last = self.driver.execute_script("return JSON.stringify(window.__licLastReq || null)")
+            seen = self.driver.execute_script("return String(window.__licLastSeen || 'none')")
+            force = self.driver.execute_script("return !!window.__licForceFalse")
             installed = self.driver.execute_script("return !!window.__licHookInstalled")
             status = self.driver.execute_script("return window.__licLastRespStatus || null")
             resp = self.driver.execute_script("return String(window.__licLastResp || 'none')")
-            log(f"{where}: hook={installed} intercepted {hits}x lastReq={last} respStatus={status} resp={resp}", "info")
+            log(f"{where}: hook={installed} force={force} rewrites={hits} sent={seen} respStatus={status} resp={resp}", "info")
             return resp
         except Exception as e:
             log(f"{where}: hook read failed: {e}", "warn")
@@ -3552,6 +3586,7 @@ if (!window.__licHookInstalled) {
     window.__licLastReq = null;
     window.__licLastResp = null;
     window.__licLastRespStatus = null;
+    window.__licForceFalse = false;
     var watchResp = function (res) {
         try {
             window.__licLastRespStatus = res.status;
@@ -3568,12 +3603,15 @@ if (!window.__licHookInstalled) {
     var fixBody = function (body) {
         try {
             if (typeof body === 'string' && body.indexOf('"isBound"') !== -1) {
-                var o = JSON.parse(body);
-                if (o && o.isBound === true) {
-                    o.isBound = false;
-                    window.__licHits++;
-                    window.__licLastReq = o;
-                    return JSON.stringify(o);
+                window.__licLastSeen = body;
+                if (window.__licForceFalse === true) {
+                    var o = JSON.parse(body);
+                    if (o && o.isBound === true) {
+                        o.isBound = false;
+                        window.__licHits++;
+                        window.__licLastReq = o;
+                        return JSON.stringify(o);
+                    }
                 }
             }
         } catch (e) {}
@@ -3642,7 +3680,7 @@ def _inject_license_hook(driver):
             driver._lic_hook_cdp = True
         except Exception as e:
             log(f"license hook CDP register failed: {e}", "warn")
-    log("license hook installed (isBound -> false)", "ok")
+    log("license hook installed (rewrites armed only on demand)", "ok")
     return True
 
 
