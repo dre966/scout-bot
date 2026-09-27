@@ -3689,6 +3689,9 @@ _DEAD_DRIVER_MARKERS = (
     "chrome not reachable", "invalid session id", "no such session",
     "chrome not started", "target window already closed", "chrome instance already killed",
     "errno 111", "broken pipe", "session deleted because of page crash",
+    "target crashed", "chrome instance crashed", "instance crashed",
+    "unable to receive message from renderer", "not connected to devtools",
+    "target closed", "webview", "renderer process", "page crash", "crash",
 )
 
 
@@ -3715,6 +3718,49 @@ def _recreate_browser(driver, port):
         log(f"relaunch navigate failed: {e}", "warn")
     log("browser recreated", "ok")
     return new_driver
+
+
+def _recover_browser(driver, bot, port, tries, err, max_tries):
+    """Bring the browser back after a crash. Returns (driver, bot, tries, action)."""
+    tries += 1
+    msg = str(err).replace("\n", " ")[:200]
+    if tries > max_tries:
+        log(f"browser dead {tries}x — giving up so the container restarts: {msg}", "error")
+        try:
+            _post_to_server("notify.php", {
+                "bot_id": BOT_ID, "type": "BrowserDead",
+                "message": f"Chrome crashed {tries}x and could not be recreated: {msg}",
+                "priority": "high", "details": {"error": msg}
+            })
+        except Exception:
+            pass
+        return driver, bot, tries, "giveup"
+
+    # Session may still be alive after a tab/renderer crash — cheap reload first
+    if not _is_dead_driver_error(err):
+        try:
+            log(f"browser crash — session alive, reloading page ({msg})", "warn")
+            driver.get(cfg.BASE_URL)
+            time.sleep(3)
+            driver.execute_script("return 1")
+            log("page recovered without relaunch", "ok")
+            return driver, bot, tries, "ok"
+        except Exception as e2:
+            log(f"reload failed: {e2}", "warn")
+
+    log(f"browser dead — recreate attempt {tries}/{max_tries}: {msg}", "warn")
+    new_driver = _recreate_browser(driver, port)
+    if new_driver is None:
+        time.sleep(10)
+        return driver, bot, tries, "retry"
+    try:
+        new_bot = SiteBot(new_driver)
+        new_bot.running = True
+    except Exception as e:
+        log(f"rebuilt SiteBot failed: {e}", "warn")
+        new_bot = bot
+    log("bot rebound to new browser", "ok")
+    return new_driver, new_bot, 0, "ok"
 
 
 def connect_to_chrome(port=None):
@@ -3838,6 +3884,15 @@ def run():
     MAX_RECREATE = 3
     recreate_tries = 0
     while getattr(bot, "running", True):
+        # Liveness probe — catches a silently dead/tab-crashed Chrome before the tick
+        try:
+            driver.execute_script("return 1")
+        except Exception as pe:
+            log(f"browser probe failed: {str(pe).replace(chr(10), ' ')[:200]}", "warn")
+            driver, bot, recreate_tries, action = _recover_browser(driver, bot, port, recreate_tries, pe, MAX_RECREATE)
+            if action == "giveup":
+                break
+            continue
         try:
             bot.tick()
             time.sleep(random_delay())
@@ -3876,34 +3931,15 @@ def run():
             log(f"Exit: {e}", "warn")
             break
         except Exception as e:
-            log(f"Tick error: {e}", "error")
+            log(f"Tick error: {str(e).replace(chr(10), ' ')[:400]}", "error")
             try:
                 bot.log.error(str(e))
             except Exception:
                 pass
             if _is_dead_driver_error(e):
-                recreate_tries += 1
-                if recreate_tries > MAX_RECREATE:
-                    log(f"browser dead {recreate_tries}x — giving up so the container restarts", "error")
-                    try:
-                        _post_to_server("notify.php", {
-                            "bot_id": BOT_ID, "type": "BrowserDead",
-                            "message": f"Chrome crashed {recreate_tries}x and could not be recreated",
-                            "priority": "high", "details": {"error": str(e)[:300]}
-                        })
-                    except Exception:
-                        pass
+                driver, bot, recreate_tries, action = _recover_browser(driver, bot, port, recreate_tries, e, MAX_RECREATE)
+                if action == "giveup":
                     break
-                log(f"driver connection dead — recreate attempt {recreate_tries}/{MAX_RECREATE}", "warn")
-                new_driver = _recreate_browser(driver, port)
-                if new_driver is not None:
-                    driver = new_driver
-                    bot = SiteBot(driver)
-                    bot.running = True
-                    recreate_tries = 0
-                    log("bot rebound to new browser", "ok")
-                    continue
-                time.sleep(10)
                 continue
             time.sleep(5)
 
