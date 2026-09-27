@@ -964,6 +964,7 @@ class SiteBot:
             self.tested_numbers.clear()
             pool = candidates
         cand = random.choice(pool)
+        self.last_pair_number = cand.get("phone")
         payload = {"simId": sim_id, "numberId": cand["id"], "packageId": package_id}
         pair_url = "https://scoutandrunner.com/api/scout/sessions"
         log(f"[pair] POST {pair_url}", "info")
@@ -983,14 +984,16 @@ class SiteBot:
                 time.sleep(2)
                 return True
             elif resp.status_code == 409:
-                log("Session already exists for this pair — trying another", "warn")
+                log(f"[pair] FAILED number={cand['phone']} [{cand['country']}] sim={sim.get('phoneNumber')} — session exists, trying another", "warn")
                 log(f"[pair] response {resp.status_code} {resp.text[:400]}", "info")
                 return False
             else:
                 log(f"POST failed: {resp.status_code} {resp.text[:200]}", "warn")
+                log(f"[pair] FAILED number={cand['phone']} [{cand['country']}] sim={sim.get('phoneNumber')} pkg={package_id} http={resp.status_code}", "warn")
                 log(f"[pair] response {resp.status_code} {resp.text[:500]}", "info")
                 return False
         except Exception as e:
+            log(f"[pair] FAILED number={cand['phone']} [{cand['country']}] sim={sim.get('phoneNumber')} error={e}", "warn")
             log(f"Error creating session: {e}", "warn")
             return False
 
@@ -2866,7 +2869,7 @@ class SiteBot:
                     log(f"step_click fallback failed: {e2}", "warn")
             if not ok:
                 # All 8/8 or no pairs -> already emitted NoNumbersToTest high in api_pair; break loop by returning to dashboard for fresh SIM check
-                log("test_numbers_available: no pair created -> back to dashboard for SIM re-check (throttle 15s)", "warn")
+                log(f"test_numbers_available: no pair created (last number tried: {getattr(self, 'last_pair_number', '?')}) -> back to dashboard for SIM re-check (throttle 15s)", "warn")
                 time.sleep(15)
                 try:
                     self.driver.get(cfg.BASE_URL + "/scout")
