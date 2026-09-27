@@ -2201,7 +2201,7 @@ class SiteBot:
         return candidates
 
     def _click_license_refresh(self):
-        keys = ("refresh", "reload", "clockwise", "arrowclockwise", "re-fetch", "refetch")
+        keys = ("refresh", "reload", "clockwise", "arrowclockwise", "re-fetch", "refetch", "try again", "check again", "retry")
         try:
             for btn in self.driver.find_elements(By.TAG_NAME, "button"):
                 try:
@@ -2227,7 +2227,7 @@ class SiteBot:
         # JS fallback: any button/svg whose label mentions refresh
         try:
             clicked = self.driver.execute_script("""
-                var keys = ['refresh','reload','clockwise'];
+                var keys = ['refresh', 'reload', 'clockwise', 'refetch', 'retry', 'again'];
                 var els = document.querySelectorAll('button, [role=button], svg');
                 for (var i = 0; i < els.length; i++) {
                     var el = els[i];
@@ -2570,6 +2570,28 @@ class SiteBot:
 
     def do_no_active_license(self):
         log("STATE: no_active_license", "warn")
+        now = time.time()
+        if now - getattr(self, "_lic_refresh_ts", 0) < 8:
+            time.sleep(1)
+            return False
+        self._lic_refresh_ts = now
+        _inject_license_hook(self.driver)
+        clicked = self._click_license_refresh()
+        if not clicked:
+            try:
+                log("no_active_license: no refresh button — reloading page (hook is CDP-registered)", "info")
+                self.driver.refresh()
+                time.sleep(3)
+                clicked = self._click_license_refresh()
+            except Exception as e:
+                log(f"no_active_license: reload failed: {e}", "warn")
+        time.sleep(2.5)
+        try:
+            hits = self.driver.execute_script("return window.__licHits || 0")
+            last = self.driver.execute_script("return JSON.stringify(window.__licLastReq || null)")
+            log(f"no_active_license: licenses_get_licenses intercepted {hits}x, last req {last}", "info")
+        except Exception as e:
+            log(f"no_active_license: hook read failed: {e}", "warn")
         return True
 
     def do_identity_verified(self):
@@ -3541,14 +3563,24 @@ if (!window.__licHookInstalled) {
 
 
 def _inject_license_hook(driver):
-    """Rewrite licenses_get_licenses body isBound true->false (fetch + XHR)."""
+    """Rewrite licenses_get_licenses body isBound true->false (fetch + XHR).
+
+    Also registers via CDP addScriptToEvaluateOnNewDocument so the hook
+    survives page reloads (the reload itself triggers the refetch).
+    """
     try:
         driver.execute_script(_LICENSE_HOOK_JS)
-        log("license hook installed (isBound -> false)", "ok")
-        return True
     except Exception as e:
         log(f"license hook inject failed: {e}", "warn")
         return False
+    if not getattr(driver, "_lic_hook_cdp", False):
+        try:
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": _LICENSE_HOOK_JS})
+            driver._lic_hook_cdp = True
+        except Exception as e:
+            log(f"license hook CDP register failed: {e}", "warn")
+    log("license hook installed (isBound -> false)", "ok")
+    return True
 
 
 _DEAD_DRIVER_MARKERS = (
