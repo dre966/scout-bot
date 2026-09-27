@@ -2260,6 +2260,7 @@ class SiteBot:
         # License cards are buttons with border-cta-teal etc.
         _inject_license_hook(self.driver)
         candidates = self._scan_license_cards()
+        self._log_license_hook("license_select")
 
         if not candidates:
             log("license_select: no license — installing hook + clicking Refresh", "warn")
@@ -2267,12 +2268,7 @@ class SiteBot:
             if self._click_license_refresh():
                 time.sleep(2.5)
                 candidates = self._scan_license_cards()
-                try:
-                    hits = self.driver.execute_script("return window.__licHits || 0")
-                    last = self.driver.execute_script("return JSON.stringify(window.__licLastReq || null)")
-                    log(f"license_select: licenses_get_licenses intercepted {hits}x, last req {last}", "info")
-                except Exception as e:
-                    log(f"license_select: hook read failed: {e}", "warn")
+                self._log_license_hook("license_select:after_refresh")
 
         log(f"license_select: found {len(candidates)} candidate license cards", "info")
 
@@ -2586,13 +2582,19 @@ class SiteBot:
             except Exception as e:
                 log(f"no_active_license: reload failed: {e}", "warn")
         time.sleep(2.5)
+        self._log_license_hook("no_active_license")
+        return True
+
+    def _log_license_hook(self, where):
         try:
             hits = self.driver.execute_script("return window.__licHits || 0")
             last = self.driver.execute_script("return JSON.stringify(window.__licLastReq || null)")
-            log(f"no_active_license: licenses_get_licenses intercepted {hits}x, last req {last}", "info")
+            installed = self.driver.execute_script("return !!window.__licHookInstalled")
+            log(f"{where}: hook={installed} licenses_get_licenses intercepted {hits}x, last req {last}", "info")
+            return hits
         except Exception as e:
-            log(f"no_active_license: hook read failed: {e}", "warn")
-        return True
+            log(f"{where}: hook read failed: {e}", "warn")
+            return -1
 
     def do_identity_verified(self):
         log("STATE: identity_verified - continue", "ok")
