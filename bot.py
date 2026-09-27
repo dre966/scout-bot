@@ -965,10 +965,18 @@ class SiteBot:
             pool = candidates
         cand = random.choice(pool)
         payload = {"simId": sim_id, "numberId": cand["id"], "packageId": package_id}
+        pair_url = "https://scoutandrunner.com/api/scout/sessions"
+        log(f"[pair] POST {pair_url}", "info")
+        log(f"[pair] payload {json.dumps(payload)}", "info")
+        log(f"[pair] headers {{{', '.join(f'{k!r}: {v!r}' for k, v in headers.items())}}}", "info")
+        log("[pair] curl " + f"curl -X POST '{pair_url}' " +
+            " ".join(f"-H '{k}: {v}'" for k, v in headers.items()) +
+            f" -d '{json.dumps(payload)}'", "info")
         try:
-            resp = requests.post("https://scoutandrunner.com/api/scout/sessions", json=payload, headers=headers, timeout=10)
+            resp = requests.post(pair_url, json=payload, headers=headers, timeout=10)
             if resp.status_code in (200, 201):
                 log(f"Session created! SIM: {sim.get('phoneNumber', sim_id[:8])} | Number: {cand['phone']} [{cand['country']}]", "ok")
+                log(f"[pair] response {resp.status_code} {resp.text[:400]}", "info")
                 self.tested_numbers.add(cand["phone"])
                 self.noted_phone_number = cand["phone"]
                 self.driver.refresh()
@@ -976,9 +984,11 @@ class SiteBot:
                 return True
             elif resp.status_code == 409:
                 log("Session already exists for this pair — trying another", "warn")
+                log(f"[pair] response {resp.status_code} {resp.text[:400]}", "info")
                 return False
             else:
                 log(f"POST failed: {resp.status_code} {resp.text[:200]}", "warn")
+                log(f"[pair] response {resp.status_code} {resp.text[:500]}", "info")
                 return False
         except Exception as e:
             log(f"Error creating session: {e}", "warn")
