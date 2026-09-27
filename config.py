@@ -211,8 +211,9 @@ API_PAIRING = os.getenv("API_PAIRING", "true").lower() == "true"
 
 # API Candidates - can be loaded from environment or file
 API_CANDIDATES = [
-    {"id": "57ca0fd4-0f64-440e-b483-af4e6fb057eb", "phone": "+59170702213", "country": "BO"},
-    {"id": "57f4364c-eeac-4e2c-b53d-496eb0b2ffab", "phone": "+59170702225", "country": "BO"},
+    # BO pairings closed (NO_OPEN_SEAT) — commented out 2026-09-27
+    # {"id": "57ca0fd4-0f64-440e-b483-af4e6fb057eb", "phone": "+59170702213", "country": "BO"},
+    # {"id": "57f4364c-eeac-4e2c-b53d-496eb0b2ffab", "phone": "+59170702225", "country": "BO"},
     {"id": "45d6a83b-5419-457c-afa6-0d59ba4ef298", "phone": "+556238420016", "country": "BR"},
     {"id": "2a385acd-0ff6-425e-a2b0-97447d8ecbca", "phone": "+972555072455", "country": "IL"},
     {"id": "6d7c54f7-41b9-4588-adc1-6c87dab33eb6", "phone": "+576015800761", "country": "CO"},
@@ -221,7 +222,7 @@ API_CANDIDATES = [
     {"id": "d15626e9-a085-40d3-bfcf-b2b471b2f065", "phone": "+447520685978", "country": "GB"},
     {"id": "7ef51023-d3e4-4e9d-8174-e09d5bb49b5b", "phone": "+5531910142717", "country": "BR"},
     {"id": "3f706d3b-8ee8-4213-a300-1edfb453d753", "phone": "+529986090147", "country": "MX"},
-    {"id": "e174241e-f3de-45a4-9410-a1d7f3880fb7", "phone": "+59170702216", "country": "BO"},
+    # {"id": "e174241e-f3de-45a4-9410-a1d7f3880fb7", "phone": "+59170702216", "country": "BO"},
     {"id": "40df488c-7309-4ed8-9926-c4be803a9d76", "phone": "+441224015590", "country": "GB"},
     {"id": "cf355799-8441-441d-83c4-2a8fc2fd0105", "phone": "+573009158931", "country": "CO"},
     {"id": "5bf0c604-a41a-4a95-8963-60ed9ac42940", "phone": "+4592452876", "country": "DK"},
