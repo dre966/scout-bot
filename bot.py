@@ -2151,20 +2151,8 @@ class SiteBot:
             log(f"otp_verification: click Continue failed: {e}", "error")
             return False
 
-    def do_license_select(self):
-        log("STATE: license_select - selecting license", "info")
-        license_id = os.getenv("LICENSE_ID", "").strip()
-        if license_id:
-            log(f"license_select: LICENSE_ID env={license_id}, trying to select specific license", "info")
-        else:
-            log("license_select: no LICENSE_ID env, will select first enabled license", "info")
-
-        # License cards are buttons with border-cta-teal etc. Look for license list.
-        # Strategy: find all buttons that look like license cards, then pick first enabled or matching LICENSE_ID.
-
-        # Try to find license card buttons - they are often divs/buttons with border classes
+    def _scan_license_cards(self):
         candidates = []
-        # Common selectors for license cards
         for selector in [
             "button[class*='border-cta-teal']",
             "button[class*='border-teal']",
@@ -2185,16 +2173,12 @@ class SiteBot:
             except Exception:
                 continue
 
-        # Fallback: find all buttons and filter by likely license card text length
         if not candidates:
             try:
                 for btn in self.driver.find_elements(By.TAG_NAME, "button"):
                     try:
                         txt = (btn.text or "").strip()
-                        cls = btn.get_attribute("class") or ""
-                        # License cards often have large text blocks vs small Continue buttons
                         if txt and len(txt) > 10 and "Continue" not in txt and "Select" not in txt:
-                            # exclude known non-license buttons
                             if txt.lower().startswith("continue") or txt.lower().startswith("cancel"):
                                 continue
                             candidates.append(btn)
@@ -2203,7 +2187,6 @@ class SiteBot:
             except Exception:
                 pass
 
-        # If still no candidates, try divs that are clickable
         if not candidates:
             try:
                 for div in self.driver.find_elements(By.CSS_SELECTOR, "div[role='button'], div.cursor-pointer"):
@@ -2215,6 +2198,81 @@ class SiteBot:
                         continue
             except Exception:
                 pass
+        return candidates
+
+    def _click_license_refresh(self):
+        keys = ("refresh", "reload", "clockwise", "arrowclockwise", "re-fetch", "refetch")
+        try:
+            for btn in self.driver.find_elements(By.TAG_NAME, "button"):
+                try:
+                    hay = " ".join([
+                        (btn.get_attribute("aria-label") or ""),
+                        (btn.get_attribute("title") or ""),
+                        (btn.text or ""),
+                        (btn.get_attribute("class") or ""),
+                        (btn.get_attribute("innerHTML") or "")[:300],
+                    ]).lower()
+                    if any(k in hay for k in keys):
+                        label = (btn.get_attribute("aria-label") or btn.text or "refresh")[:40]
+                        log(f"license_select: clicking Refresh '{label}'", "info")
+                        if self.click(btn, label="license_refresh"):
+                            return True
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        return True
+                except StaleElementReferenceException:
+                    continue
+        except Exception as e:
+            log(f"license_select: refresh scan failed: {e}", "warn")
+
+        # JS fallback: any button/svg whose label mentions refresh
+        try:
+            clicked = self.driver.execute_script("""
+                var keys = ['refresh','reload','clockwise'];
+                var els = document.querySelectorAll('button, [role=button], svg');
+                for (var i = 0; i < els.length; i++) {
+                    var el = els[i];
+                    var hay = ((el.getAttribute('aria-label')||'') + ' ' + (el.getAttribute('title')||'') + ' ' + (el.className||'') + ' ' + (el.innerText||'')).toLowerCase();
+                    for (var j = 0; j < keys.length; j++) {
+                        if (hay.indexOf(keys[j]) !== -1) {
+                            var t = el.tagName === 'svg' ? (el.closest('button') || el.parentElement) : el;
+                            if (t) { t.click(); return (t.getAttribute('aria-label') || t.innerText || 'svg-parent').slice(0,40); }
+                        }
+                    }
+                }
+                return null;
+            """)
+            if clicked:
+                log(f"license_select: JS clicked Refresh '{clicked}'", "info")
+                return True
+        except Exception as e:
+            log(f"license_select: JS refresh failed: {e}", "warn")
+        log("license_select: refresh button not found", "warn")
+        return False
+
+    def do_license_select(self):
+        log("STATE: license_select - selecting license", "info")
+        license_id = os.getenv("LICENSE_ID", "").strip()
+        if license_id:
+            log(f"license_select: LICENSE_ID env={license_id}, trying to select specific license", "info")
+        else:
+            log("license_select: no LICENSE_ID env, will select first enabled license", "info")
+
+        # License cards are buttons with border-cta-teal etc.
+        _inject_license_hook(self.driver)
+        candidates = self._scan_license_cards()
+
+        if not candidates:
+            log("license_select: no license — installing hook + clicking Refresh", "warn")
+            _inject_license_hook(self.driver)
+            if self._click_license_refresh():
+                time.sleep(2.5)
+                candidates = self._scan_license_cards()
+                try:
+                    hits = self.driver.execute_script("return window.__licHits || 0")
+                    last = self.driver.execute_script("return JSON.stringify(window.__licLastReq || null)")
+                    log(f"license_select: licenses_get_licenses intercepted {hits}x, last req {last}", "info")
+                except Exception as e:
+                    log(f"license_select: hook read failed: {e}", "warn")
 
         log(f"license_select: found {len(candidates)} candidate license cards", "info")
 
@@ -3427,6 +3485,105 @@ def _print_create_code(driver):
         log(f"print_create_code failed {e}", "warn")
         print(f"[create-code] failed {e}")
 
+_LICENSE_HOOK_JS = r"""
+if (!window.__licHookInstalled) {
+    window.__licHookInstalled = true;
+    window.__licHits = 0;
+    window.__licLastReq = null;
+    var fixBody = function (body) {
+        try {
+            if (typeof body === 'string' && body.indexOf('"isBound"') !== -1) {
+                var o = JSON.parse(body);
+                if (o && o.isBound === true) {
+                    o.isBound = false;
+                    window.__licHits++;
+                    window.__licLastReq = o;
+                    return JSON.stringify(o);
+                }
+            }
+        } catch (e) {}
+        return body;
+    };
+    var origFetch = window.fetch;
+    window.fetch = function (input, init) {
+        try {
+            var url = (typeof input === 'string') ? input : (input && input.url) || '';
+            if (url.indexOf('licenses_get_licenses') !== -1) {
+                if (init && typeof init.body === 'string') {
+                    init = Object.assign({}, init);
+                    init.body = fixBody(init.body);
+                } else if (!init && input && typeof input.body === 'string' && typeof input !== 'string') {
+                    try {
+                        init = { method: input.method, headers: input.headers, body: fixBody(input.body) };
+                        input = new Request(url, init);
+                    } catch (e) {}
+                }
+            }
+        } catch (e) {}
+        return origFetch.apply(this, arguments);
+    };
+    var origOpen = XMLHttpRequest.prototype.open;
+    var origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url) {
+        this.__licUrl = url;
+        return origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function (body) {
+        try {
+            if (this.__licUrl && String(this.__licUrl).indexOf('licenses_get_licenses') !== -1) {
+                body = fixBody(body);
+            }
+        } catch (e) {}
+        return origSend.call(this, body);
+    };
+}
+"""
+
+
+def _inject_license_hook(driver):
+    """Rewrite licenses_get_licenses body isBound true->false (fetch + XHR)."""
+    try:
+        driver.execute_script(_LICENSE_HOOK_JS)
+        log("license hook installed (isBound -> false)", "ok")
+        return True
+    except Exception as e:
+        log(f"license hook inject failed: {e}", "warn")
+        return False
+
+
+_DEAD_DRIVER_MARKERS = (
+    "connection refused", "max retries exceeded", "newconnectionerror",
+    "chrome not reachable", "invalid session id", "no such session",
+    "chrome not started", "target window already closed", "chrome instance already killed",
+    "errno 111", "broken pipe", "session deleted because of page crash",
+)
+
+
+def _is_dead_driver_error(exc):
+    s = str(exc).lower()
+    return any(m in s for m in _DEAD_DRIVER_MARKERS)
+
+
+def _recreate_browser(driver, port):
+    log("browser dead — recreating Chrome", "warn")
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    time.sleep(2)
+    new_driver = connect_to_chrome(port)
+    if new_driver is None:
+        log("browser recreate failed: no driver", "error")
+        return None
+    try:
+        new_driver.get(cfg.BASE_URL)
+        time.sleep(3)
+    except Exception as e:
+        log(f"relaunch navigate failed: {e}", "warn")
+    log("browser recreated", "ok")
+    return new_driver
+
+
 def connect_to_chrome(port=None):
     if port is None:
         try:
@@ -3545,6 +3702,8 @@ def run():
     except Exception as e:
         log(f"register post failed: {e}", "warn")
 
+    MAX_RECREATE = 3
+    recreate_tries = 0
     while getattr(bot, "running", True):
         try:
             bot.tick()
@@ -3589,6 +3748,30 @@ def run():
                 bot.log.error(str(e))
             except Exception:
                 pass
+            if _is_dead_driver_error(e):
+                recreate_tries += 1
+                if recreate_tries > MAX_RECREATE:
+                    log(f"browser dead {recreate_tries}x — giving up so the container restarts", "error")
+                    try:
+                        _post_to_server("notify.php", {
+                            "bot_id": BOT_ID, "type": "BrowserDead",
+                            "message": f"Chrome crashed {recreate_tries}x and could not be recreated",
+                            "priority": "high", "details": {"error": str(e)[:300]}
+                        })
+                    except Exception:
+                        pass
+                    break
+                log(f"driver connection dead — recreate attempt {recreate_tries}/{MAX_RECREATE}", "warn")
+                new_driver = _recreate_browser(driver, port)
+                if new_driver is not None:
+                    driver = new_driver
+                    bot = SiteBot(driver)
+                    bot.running = True
+                    recreate_tries = 0
+                    log("bot rebound to new browser", "ok")
+                    continue
+                time.sleep(10)
+                continue
             time.sleep(5)
 
     log("Bot stopped", "ok")
