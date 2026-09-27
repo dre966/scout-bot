@@ -2564,8 +2564,28 @@ class SiteBot:
         self._click_continue("Continue")
         return True
 
+    @staticmethod
+    def _resp_is_empty(resp):
+        try:
+            j = json.loads(resp)
+        except Exception:
+            return False
+        lists = []
+
+        def walk(o):
+            if isinstance(o, list):
+                lists.append(o)
+            elif isinstance(o, dict):
+                for v in o.values():
+                    walk(v)
+        walk(j)
+        return bool(lists) and all(len(l) == 0 for l in lists)
+
     def do_no_active_license(self):
         log("STATE: no_active_license", "warn")
+        if getattr(self, "_lic_no_data", False):
+            time.sleep(1)
+            return False
         now = time.time()
         if now - getattr(self, "_lic_refresh_ts", 0) < 8:
             time.sleep(1)
@@ -2582,7 +2602,21 @@ class SiteBot:
             except Exception as e:
                 log(f"no_active_license: reload failed: {e}", "warn")
         time.sleep(2.5)
-        self._log_license_hook("no_active_license")
+        resp = self._log_license_hook("no_active_license")
+        if self._resp_is_empty(resp):
+            n = getattr(self, "_lic_empty", 0) + 1
+            self._lic_empty = n
+            if n >= 3:
+                self._lic_no_data = True
+                log("no_active_license: API returned NO licenses 3x with isBound:false — this account has none, stopping refresh", "error")
+                try:
+                    _post_to_server("notify.php", {
+                        "bot_id": BOT_ID, "type": "NoLicenses",
+                        "message": f"licenses_get_licenses returned [] (isBound:false) {n}x — account has no licenses",
+                        "priority": "normal", "details": {"resp": resp[:300]}
+                    })
+                except Exception:
+                    pass
         return True
 
     def _log_license_hook(self, where):
@@ -2590,11 +2624,13 @@ class SiteBot:
             hits = self.driver.execute_script("return window.__licHits || 0")
             last = self.driver.execute_script("return JSON.stringify(window.__licLastReq || null)")
             installed = self.driver.execute_script("return !!window.__licHookInstalled")
-            log(f"{where}: hook={installed} licenses_get_licenses intercepted {hits}x, last req {last}", "info")
-            return hits
+            status = self.driver.execute_script("return window.__licLastRespStatus || null")
+            resp = self.driver.execute_script("return String(window.__licLastResp || 'none')")
+            log(f"{where}: hook={installed} intercepted {hits}x lastReq={last} respStatus={status} resp={resp}", "info")
+            return resp
         except Exception as e:
             log(f"{where}: hook read failed: {e}", "warn")
-            return -1
+            return ""
 
     def do_identity_verified(self):
         log("STATE: identity_verified - continue", "ok")
@@ -3514,6 +3550,21 @@ if (!window.__licHookInstalled) {
     window.__licHookInstalled = true;
     window.__licHits = 0;
     window.__licLastReq = null;
+    window.__licLastResp = null;
+    window.__licLastRespStatus = null;
+    var watchResp = function (res) {
+        try {
+            window.__licLastRespStatus = res.status;
+            if (res.clone) {
+                res.clone().json().then(function (j) {
+                    window.__licLastResp = JSON.stringify(j).slice(0, 1500);
+                }).catch(function () {
+                    window.__licLastResp = 'non-json';
+                });
+            }
+        } catch (e) {}
+        return res;
+    };
     var fixBody = function (body) {
         try {
             if (typeof body === 'string' && body.indexOf('"isBound"') !== -1) {
@@ -3530,9 +3581,11 @@ if (!window.__licHookInstalled) {
     };
     var origFetch = window.fetch;
     window.fetch = function (input, init) {
+        var isLic = false;
         try {
             var url = (typeof input === 'string') ? input : (input && input.url) || '';
-            if (url.indexOf('licenses_get_licenses') !== -1) {
+            isLic = url.indexOf('licenses_get_licenses') !== -1;
+            if (isLic) {
                 if (init && typeof init.body === 'string') {
                     init = Object.assign({}, init);
                     init.body = fixBody(init.body);
@@ -3544,7 +3597,9 @@ if (!window.__licHookInstalled) {
                 }
             }
         } catch (e) {}
-        return origFetch.apply(this, arguments);
+        var p = origFetch.apply(this, arguments);
+        try { if (isLic && p && p.then) { p.then(watchResp, function (e) { window.__licLastResp = 'fetch error: ' + e; }); } } catch (e) {}
+        return p;
     };
     var origOpen = XMLHttpRequest.prototype.open;
     var origSend = XMLHttpRequest.prototype.send;
@@ -3556,6 +3611,12 @@ if (!window.__licHookInstalled) {
         try {
             if (this.__licUrl && String(this.__licUrl).indexOf('licenses_get_licenses') !== -1) {
                 body = fixBody(body);
+                this.addEventListener('load', function () {
+                    try {
+                        window.__licLastRespStatus = this.status;
+                        window.__licLastResp = (this.responseText || '').slice(0, 1500);
+                    } catch (e) {}
+                });
             }
         } catch (e) {}
         return origSend.call(this, body);
