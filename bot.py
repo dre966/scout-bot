@@ -83,70 +83,6 @@ def _get_from_server(endpoint, params=None):
     return None
 
 
-_UP_RPC_URL = "https://api.unityedge.io/rest/v1/rpc/rewards_get_balance"
-_UP_REFRESH_INTERVAL = 300
-_UP_HEADERS = {
-    "accept": "*/*",
-    "accept-language": "en-US,en;q=0.9,es;q=0.8",
-    "apikey": "sb_publishable_yKqi0fu5vV6G4ryUIMJuzw_NCoFEl1c",
-    "content-profile": "public",
-    "content-type": "application/json",
-    "origin": "https://manage.unetwork.io",
-    "referer": "https://manage.unetwork.io/",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
-    "x-client-info": "supabase-js-web/2.87.1",
-}
-
-
-def _parse_up_balance(data):
-    if isinstance(data, bool):
-        return None
-    if isinstance(data, (int, float)):
-        return int(data)
-    if isinstance(data, str):
-        s = data.strip()
-        if s.isdigit():
-            return int(s)
-        try:
-            return int(float(s))
-        except ValueError:
-            return None
-    if isinstance(data, dict):
-        for k in ("balance", "rewards_balance", "rewards", "up_balance", "amount", "value", "data", "result"):
-            if k in data:
-                v = _parse_up_balance(data[k])
-                if v is not None:
-                    return v
-        for v in data.values():
-            r = _parse_up_balance(v)
-            if r is not None:
-                return r
-    if isinstance(data, list) and data:
-        return _parse_up_balance(data[0])
-    return None
-
-
-def _fetch_up_balance(token, timeout=15):
-    """UnityEdge rewards_get_balance with the bot's supabase token. Returns micro-UP int or None."""
-    if not token:
-        return None
-    h = dict(_UP_HEADERS)
-    h["authorization"] = f"Bearer {token}"
-    try:
-        r = requests.post(_UP_RPC_URL, headers=h, json={}, timeout=timeout)
-        if r.status_code != 200:
-            log(f"[up] balance http={r.status_code} {r.text[:160]}", "warn")
-            return None
-        try:
-            data = r.json()
-        except ValueError:
-            data = r.text
-        return _parse_up_balance(data)
-    except Exception as e:
-        log(f"[up] balance failed: {e}", "warn")
-        return None
-
-
 def _extract_auth_token(driver):
     """Robustly extract bearer token from browser storage.
     Checks cv-auth-storage (capture_token.py key: state.token), Supabase keys, etc.
@@ -3575,30 +3511,6 @@ class SiteBot:
         except Exception as e:
             log(f"stuck check failed: {e}", "warn")
 
-    def refresh_up_balance(self, force=False):
-        """Fetch UP balance from UnityEdge rewards_get_balance (throttled to every 5 min)."""
-        now = time.time()
-        if not force and now - getattr(self, "_up_balance_ts", 0) < _UP_REFRESH_INTERVAL:
-            return getattr(self, "up_balance", None)
-        self._up_balance_ts = now
-        token = getattr(self, "supabase_token", None)
-        if not token:
-            try:
-                j = _get_from_server("license_capture.php", {"bot_id": BOT_ID})
-                token = (j or {}).get("supabaseToken")
-            except Exception:
-                token = None
-            if token:
-                self.supabase_token = token
-        if not token:
-            log("[up] no supabase token available for balance", "warn")
-            return None
-        bal = _fetch_up_balance(token)
-        if bal is not None:
-            self.up_balance = bal
-            log(f"[up] balance {bal} -> {bal / 1_000_000:.2f} UP", "info")
-        return getattr(self, "up_balance", None)
-
     def tick(self):
         # Poll server commands first (non-blocking, every ~2.5s)
         try:
@@ -3608,10 +3520,6 @@ class SiteBot:
         state = self.identify_state()
         log(f"[state] {state}")
         # heartbeat to comms server (silent fail so bot never dies if server down)
-        try:
-            self.refresh_up_balance()
-        except Exception as e:
-            log(f"up balance refresh failed: {e}", "warn")
         try:
             _proxy = getattr(self, "noted_proxy", None) or getattr(self, "proxy_email", None)
             _poll = getattr(self, "poll_inbox", None)
@@ -3626,7 +3534,6 @@ class SiteBot:
                 "poll_inbox": _poll,
                 "state": state,
                 "sims_count": getattr(self, "stored_verification_count", 0),
-                "up_balance": getattr(self, "up_balance", None),
                 "current_url": self.driver.current_url if hasattr(self.driver, "current_url") else ""
             })
         except Exception as e:
