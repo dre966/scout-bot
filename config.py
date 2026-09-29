@@ -230,6 +230,10 @@ API_CANDIDATES = [
     {"id": "5b52125a-ad56-4f24-aac2-9b8718dccdba", "phone": "+5511920839551", "country": "BR"},
     {"id": "df083f36-ce60-4a2b-a071-0462a57955d6", "phone": "+527446020345", "country": "MX"},
     {"id": "fc674b52-6700-4e86-b354-6354b34fa11f", "phone": "+5521910055680", "country": "BR"},
+    {"id": "80340ca5-82c9-4cca-8898-e7df21e2e156","phone": "+15172803033", "country": "US"},
+    {"id": "0f0bf31a-f8ac-4b31-9cf9-ad4bdbecc1a6","phone": "+15622865130","country": "US"},
+    {"id": "03e3e56d-1a32-49d8-ad54-2fe931f1f7a2","phone": "+16052777646","country": "US"},
+    {"id": "bc144bdd-87b6-4c36-8eaf-bd38fee34d4f","phone": "+16139270404","country": "US"}
 ]
 
 # Disposition map for user input
