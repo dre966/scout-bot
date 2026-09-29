@@ -3568,6 +3568,11 @@ class SiteBot:
             })
         except Exception as e:
             log(f"heartbeat post failed: {e}", "warn")
+        # keep server's supabase session fresh (create-code / UP balance need it)
+        try:
+            self.refresh_supabase_capture()
+        except Exception as e:
+            log(f"supabase capture failed: {e}", "warn")
         # slots watchdog — pings amount of slots left, notifies if stuck too long
         try:
             self._check_stuck_slots(state)
