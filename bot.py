@@ -3511,6 +3511,36 @@ class SiteBot:
         except Exception as e:
             log(f"stuck check failed: {e}", "warn")
 
+    def refresh_supabase_capture(self):
+        """Post supabase access+refresh token from browser storage so server can refresh expired JWTs."""
+        now = time.time()
+        if now - getattr(self, "_supab_cap_ts", 0) < 300:
+            return
+        self._supab_cap_ts = now
+        sess = _extract_supabase_session(self.driver)
+        if not sess or not sess.get("access_token"):
+            return
+        if getattr(self, "_supab_cap_last", None) == sess["access_token"]:
+            return
+        try:
+            payload = sess["access_token"].split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload.encode()))
+        except Exception:
+            claims = {}
+        sess_email = (claims.get("email") or "").lower()
+        want = (getattr(self, "proxy_email", None) or "").lower()
+        if sess_email and want and sess_email != want:
+            log(f"supabase session email {sess_email} != proxy {want} - not capturing", "warn")
+            return
+        _post_to_server("license_capture.php", {
+            "bot_id": BOT_ID,
+            "supabaseToken": sess["access_token"],
+            "refreshToken": sess.get("refresh_token"),
+        })
+        self._supab_cap_last = sess["access_token"]
+        log(f"supabase session posted ...{sess['access_token'][-8:]} refresh={'yes' if sess.get('refresh_token') else 'no'}", "ok")
+
     def tick(self):
         # Poll server commands first (non-blocking, every ~2.5s)
         try:
@@ -3830,7 +3860,42 @@ def connect_to_chrome(port=None):
         return driver
     except WebDriverException as e:
         log(f"Failed to launch Chrome: {e}", "error")
-        return None
+    return None
+
+
+def _extract_supabase_session(driver):
+    """Return {'access_token':..., 'refresh_token':...} from sb-*-auth-token storage, else None."""
+    js = r"""
+    try {
+        const keys = [];
+        for (let i = 0; i < localStorage.length; i++) keys.push(['localStorage', localStorage.key(i)]);
+        for (let i = 0; i < sessionStorage.length; i++) keys.push(['sessionStorage', sessionStorage.key(i)]);
+        for (const [store, k] of keys) {
+            if (!k || !k.toLowerCase().startsWith('sb-') || !k.toLowerCase().endsWith('-auth-token')) continue;
+            let v = (store === 'localStorage' ? localStorage : sessionStorage).getItem(k);
+            if (!v) continue;
+            let o = null;
+            try { o = JSON.parse(v); } catch (e) { o = null; }
+            if (typeof o === 'string') { try { o = JSON.parse(o); } catch (e) {} }
+            if (!o || typeof o !== 'object') continue;
+            let s = o;
+            if (!s.access_token && o.session && o.session.access_token) s = o.session;
+            if (!s.access_token && o.currentSession && o.currentSession.access_token) s = o.currentSession;
+            if (s.access_token && s.access_token.split('.').length === 3) {
+                return {access_token: s.access_token, refresh_token: s.refresh_token || null, key: k};
+            }
+        }
+    } catch (e) {}
+    return null;
+    """
+    try:
+        out = driver.execute_script(f"return (function(){{{js}}})()")
+        if isinstance(out, dict) and out.get("access_token"):
+            return out
+    except Exception as e:
+        log(f"extract supabase session failed: {e}", "warn")
+    return None
+
 
 
 def switch_to_target_tab(driver, url_substring=None):
