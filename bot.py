@@ -2610,14 +2610,40 @@ class SiteBot:
             log(f"no_active_license: reload failed: {e}", "warn")
             return False
 
+    def _lic_reset_latch(self, reason):
+        """Clear the permanent 'account has no licenses' verdict so we re-check."""
+        if not (getattr(self, "_lic_no_data", False) or getattr(self, "_lic_empty", 0)):
+            return
+        log(f"no_active_license: clearing no-license latch ({reason})", "info")
+        self._lic_no_data = False
+        self._lic_empty = 0
+        self._lic_force = False
+        try:
+            self.driver.execute_script("window.__licForceFalse = false;")
+        except Exception:
+            pass
+
     def do_no_active_license(self):
         log("STATE: no_active_license", "warn")
+        # navigation (logout / re-login / wake) -> start the license check fresh
+        try:
+            url = self.driver.current_url
+        except Exception:
+            url = ""
+        if url and url != getattr(self, "_lic_last_url", ""):
+            first = not hasattr(self, "_lic_last_url")
+            self._lic_last_url = url
+            if not first:
+                self._lic_reset_latch("page changed")
         if getattr(self, "_lic_no_data", False):
-            if time.time() - getattr(self, "_lic_last_hb", 0) > 30:
-                self._lic_last_hb = time.time()
-                log("no_active_license: API confirmed no licenses for this account — idling", "warn")
-            time.sleep(1)
-            return False
+            if time.time() - getattr(self, "_lic_no_data_ts", 0) > 120:
+                self._lic_reset_latch("retry window expired")
+            else:
+                if time.time() - getattr(self, "_lic_last_hb", 0) > 30:
+                    self._lic_last_hb = time.time()
+                    log("no_active_license: API confirmed no licenses for this account — idling", "warn")
+                time.sleep(1)
+                return False
         now = time.time()
         if now - getattr(self, "_lic_refresh_ts", 0) < 8:
             time.sleep(1)
@@ -2631,6 +2657,7 @@ class SiteBot:
             time.sleep(2.5)
             resp = self._log_license_hook("no_active_license:isBound=true")
             if resp and resp != "none" and not self._resp_is_empty(resp):
+                self._lic_empty = 0
                 log("no_active_license: API returned licenses with isBound:true — waiting for UI to render", "info")
                 return True
             # Stage 2: natural response empty → retry with isBound:false.
@@ -2653,6 +2680,7 @@ class SiteBot:
             self._lic_empty = n
             if n >= 3:
                 self._lic_no_data = True
+                self._lic_no_data_ts = time.time()
                 log("no_active_license: API returned NO licenses 3x with isBound:false — this account has none, stopping refresh", "error")
                 try:
                     _post_to_server("notify.php", {
