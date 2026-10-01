@@ -2596,6 +2596,13 @@ class SiteBot:
 
     def _lic_do_refresh(self):
         """Click the Refresh button; fall back to reloading the page."""
+        # a logout/navigation re-injected the hook with __licForceFalse=false —
+        # re-arm it from python state or the isBound flip never happens
+        if getattr(self, "_lic_force", False):
+            try:
+                self.driver.execute_script("window.__licForceFalse = true; window.__licLastReq = null;")
+            except Exception:
+                pass
         if self._click_license_refresh():
             return True
         try:
@@ -2612,7 +2619,7 @@ class SiteBot:
 
     def _lic_reset_latch(self, reason):
         """Clear the permanent 'account has no licenses' verdict so we re-check."""
-        if not (getattr(self, "_lic_no_data", False) or getattr(self, "_lic_empty", 0)):
+        if not (getattr(self, "_lic_no_data", False) or getattr(self, "_lic_empty", 0) or getattr(self, "_lic_force", False)):
             return
         log(f"no_active_license: clearing no-license latch ({reason})", "info")
         self._lic_no_data = False
@@ -2676,6 +2683,15 @@ class SiteBot:
             resp = self._log_license_hook("no_active_license:isBound=false")
 
         if self._resp_is_empty(resp):
+            # a miss only counts if the isBound:false flip actually went out on the wire
+            if getattr(self, "_lic_force", False):
+                try:
+                    rewrote = self.driver.execute_script("return window.__licLastReq !== null && window.__licLastReq !== undefined")
+                except Exception:
+                    rewrote = True
+                if not rewrote:
+                    log("no_active_license: flip never reached the wire (force flag lost) — re-arming, not counting this miss", "warn")
+                    return True
             n = getattr(self, "_lic_empty", 0) + 1
             self._lic_empty = n
             if n >= 3:
