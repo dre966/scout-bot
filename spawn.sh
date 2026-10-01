@@ -1,127 +1,104 @@
 #!/bin/bash
-# spawn.sh - interactive bot spawner for Debian 13 EC2
-# Lists BOT_IDs from data/routing.json and spawns selected bots via docker
+# spawn.sh - scout-bot docker spawner for EC2
+# Usage:
+#   ./spawn.sh              interactive: lists BOT_IDs, asks which to spawn
+#   ./spawn.sh 14           spawn one bot
+#   ./spawn.sh 0,1,2        spawn several
+#   ./spawn.sh 0-5          spawn a range
+#   ./spawn.sh all          spawn every BOT_ID in data/routing.json
+set -euo pipefail
 
-set -e
-
-IMAGE="scout-bot-scout-bot"
+IMAGE="scout-bot"
 DATA_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROUTING="$DATA_DIR/data/routing.json"
+ENV_FILE="${SCOUT_ENV_FILE:-/etc/scout-bot.env}"
 
-# Check deps
-if ! command -v docker >/dev/null 2>&1; then
-  echo "[!] docker not found. Install: sudo apt update && sudo apt install -y docker.io docker-compose"
-  exit 1
-fi
+# server + secrets (SERVER_URL, BOT_TOKEN, GMAIL_* ...)
+if [ -f "$ENV_FILE" ]; then set -a; . "$ENV_FILE"; set +a; fi
+export SERVER_URL="${SERVER_URL:-http://host.docker.internal/api}"
+export BOT_TOKEN="${BOT_TOKEN:-scout-secret}"
 
-if [ ! -f "$ROUTING" ]; then
-  echo "[!] routing.json not found at $ROUTING"
-  exit 1
-fi
+die() { echo "[!] $*" >&2; exit 1; }
 
-# Read GMAIL password (from data file or env)
-GMAIL_PASS="${GMAIL_FAXCHECK2_APP_PASSWORD:-}"
-if [ -z "$GMAIL_PASS" ] && [ -f "$DATA_DIR/data/gmail_app_password.txt" ]; then
-  GMAIL_PASS="$(tr -d ' \r\n' < "$DATA_DIR/data/gmail_app_password.txt")"
-fi
-if [ -z "$GMAIL_PASS" ]; then
-  echo "[!] GMAIL_FAXCHECK2_APP_PASSWORD not set and data/gmail_app_password.txt not found"
-  echo "    Set: export GMAIL_FAXCHECK2_APP_PASSWORD='your16char'"
-  exit 1
-fi
+command -v docker >/dev/null 2>&1 || die "docker not found: sudo apt install -y docker.io"
+[ -f "$ROUTING" ] || die "routing.json not found at $ROUTING"
 
-# Ensure image exists, else build
+# build image if missing
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-  echo "[*] Building $IMAGE..."
-  docker compose -f "$DATA_DIR/docker-compose.yml" build --no-cache
+  echo "[*] Building $IMAGE ..."
+  docker build -t "$IMAGE" "$DATA_DIR" >/dev/null
 fi
 
-# List BOT_IDs
-echo ""
-echo "=== Scout Bot IDs ==="
-python3 - << 'PY'
-import json, pathlib
-routing=json.loads(pathlib.Path("data/routing.json").read_text())
+# env vars to pass into the container
+ENV_ARGS=()
+while IFS= read -r v; do ENV_ARGS+=(-e "$v"); done < <(
+  compgen -v | grep -E '^(GMAIL_|SERVER_URL|BOT_TOKEN|BOT_EMAIL|LICENSE_ID|SITE_DOMAIN|BOT_MODE|API_PAIRING|POLL_INTERVAL|HUMAN_LIKE_MODE|DEBUGGER_PORT|CHROME_)' || true
+)
+
+# ---- select ids ------------------------------------------------------------
+INPUT="${1:-}"
+if [ -z "$INPUT" ]; then
+  echo ""
+  echo "=== Scout Bot IDs ==="
+  python3 - "$ROUTING" <<'PY'
+import json, sys, pathlib
+routing = json.loads(pathlib.Path(sys.argv[1]).read_text())
 for i, e in enumerate(routing):
-    typ = e["type"]
-    poll = e["poll_inbox"]
-    print(f"  {i:2d}  {e['proxy']:30s}  -> {poll:25s}  [{typ}]")
+    print(f"  {i:2d}  {e.get('proxy','?'):30s}  -> {e.get('poll_inbox','?'):25s}  [{e.get('type','?')}]")
 print()
 PY
+  echo -n "Enter BOT_ID(s) (e.g. 14 or 0,14,20 or 0-3 or 'all'): "
+  read -r INPUT
+fi
 
-echo "Enter BOT_ID(s) to spawn (e.g. 14  or  0,14,20  or  0-3  or 'all'):"
-echo -n "> "
-read -r INPUT
+N_IDS=$(python3 -c "import json;print(len(json.load(open('$ROUTING'))))")
 
-# Parse input
-IDS=""
 if [ "$INPUT" = "all" ] || [ "$INPUT" = "ALL" ]; then
-  IDS=$(python3 -c "import json; print(' '.join(str(i) for i in range(len(json.load(open('data/routing.json'))))))")
+  IDS=$(seq 0 $((N_IDS - 1)))
 else
-  # normalize commas and dashes
-  INPUT_NORM=$(echo "$INPUT" | tr ',' ' ')
-  # expand ranges like 0-3
-  IDS_EXPANDED=""
-  for token in $INPUT_NORM; do
-    if echo "$token" | grep -q "-"; then
-      START=$(echo "$token" | cut -d- -f1)
-      END=$(echo "$token" | cut -d- -f2)
-      IDS_EXPANDED="$IDS_EXPANDED $(seq $START $END)"
+  IDS=""
+  for token in $(echo "$INPUT" | tr ',' ' '); do
+    if echo "$token" | grep -qE '^[0-9]+-[0-9]+$'; then
+      IDS="$IDS $(seq "$(echo "$token" | cut -d- -f1)" "$(echo "$token" | cut -d- -f2)")"
+    elif echo "$token" | grep -qE '^[0-9]+$'; then
+      IDS="$IDS $token"
     else
-      IDS_EXPANDED="$IDS_EXPANDED $token"
+      die "invalid id: $token"
     fi
   done
-  IDS="$IDS_EXPANDED"
 fi
-
-if [ -z "$IDS" ]; then
-  echo "[!] No IDs selected"
-  exit 1
-fi
+IDS=$(echo $IDS | tr ' ' '\n' | sort -n | uniq | tr '\n' ' ')
+[ -n "$(echo $IDS | tr -d ' ')" ] || die "no ids selected"
 
 echo ""
-echo "[*] Spawning bots: $IDS"
-echo ""
+echo "[*] SERVER_URL=$SERVER_URL  spawning:$IDS"
 
 for ID in $IDS; do
-  # validate numeric
-  if ! echo "$ID" | grep -Eq '^[0-9]+$'; then echo "[!] skip invalid ID: $ID"; continue; fi
-
-  PROXY=$(python3 -c "import json; print(json.load(open('data/routing.json'))[$ID]['proxy'])" 2>/dev/null || echo "?")
-  R5900=$((5900 + ID))
-  R6080=$((6080 + ID))
-  R9222=$((9222 + ID))
+  if [ "$ID" -ge "$N_IDS" ]; then echo "[!] skip $ID (routing.json has $N_IDS entries)"; continue; fi
+  PROXY=$(python3 -c "import json;print(json.load(open('$ROUTING'))[$ID].get('proxy','?'))" 2>/dev/null || echo "?")
   NAME="scout-bot-$ID"
 
-  echo "[*] BOT_ID=$ID  proxy=$PROXY  ports $R5900:$R6080:$R9222  name=$NAME"
-
-  # remove existing container if exists
-  if docker ps -a --format '{{.Names}}' | grep -q "^${NAME}$"; then
-    echo "    -> removing existing $NAME"
+  if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
+    echo "[*] $NAME exists -> recreating"
     docker rm -f "$NAME" >/dev/null 2>&1 || true
   fi
 
   docker run -d \
     --name "$NAME" \
     --restart unless-stopped \
+    --shm-size=512m \
+    --add-host=host.docker.internal:host-gateway \
     -e BOT_ID="$ID" \
-    -e GMAIL_FAXCHECK2_APP_PASSWORD="$GMAIL_PASS" \
-    -e SERVER_URL="${SERVER_URL:-http://host.docker.internal/scout-server/api}" \
-    -e BOT_TOKEN="${BOT_TOKEN:-scout-secret}" \
-    -p "$R5900:5900" \
-    -p "$R6080:6080" \
-    -p "$R9222:9222" \
+    -p "$((5900 + ID)):5900" \
+    -p "$((6080 + ID)):6080" \
+    -p "$((9222 + ID)):9222" \
     -v "$DATA_DIR/data:/app/data" \
     -v "$DATA_DIR/logs:/app/logs" \
+    "${ENV_ARGS[@]}" \
     "$IMAGE" >/dev/null
 
-  echo "    -> up (VNC http://<ec2-ip>:$R6080  Chrome http://<ec2-ip>:$R9222)"
+  echo "[ok] $NAME up  proxy=$PROXY  vnc=:$((6080 + ID))  chrome=:$((9222 + ID))"
 done
 
 echo ""
-echo "[ok] Done. Check:"
-echo "  docker ps --format 'table {{.Names}}\t{{.Ports}}\t{{.Status}}'"
-echo "  docker logs -f scout-bot-<ID>"
-echo ""
-echo "To stop all:  docker rm -f \$(docker ps -aq --filter name=scout-bot-)"
-echo "To stop one:  docker rm -f scout-bot-14"
+docker ps --filter name=scout-bot- --format '  {{.Names}}  {{.Status}}'
