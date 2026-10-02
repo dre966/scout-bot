@@ -847,6 +847,89 @@ class SiteBot:
         except Exception:
             return None
 
+    @staticmethod
+    def _fmt_rest_duration(seconds):
+        """4500 -> '1h 15m 0s', 123 -> '2m 3s', 7 -> '7s'."""
+        h, rem = divmod(int(seconds), 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h {m}m {s}s"
+        if m:
+            return f"{m}m {s}s"
+        return f"{s}s"
+
+    def rest_until_next_cooldown(self, sims_raw):
+        """All SIMs maxed -> read time + SIMs, sleep until the earliest cooldown ends.
+
+        Sends one medium 'Resting' notification, then sleeps exactly that long
+        while heartbeating state=Resting (and polling commands) every 10s so
+        the dashboard keeps showing the bot as alive.
+
+        Returns True if it rested (caller should skip NoNumbersToTest),
+        False when there is no future cooldown to wait for.
+        """
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        closest_end = None
+        closest_phone = "?"
+        for s in sims_raw:
+            sim = s.get("sim", s) if isinstance(s, dict) and "sim" in s else s
+            raw_cd = sim.get("cooldownEndsAt")
+            if not raw_cd:
+                continue
+            try:
+                cd_end = datetime.fromisoformat(str(raw_cd).replace("Z", "+00:00"))
+                if cd_end.tzinfo is None:
+                    cd_end = cd_end.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if cd_end <= now:
+                continue
+            if closest_end is None or cd_end < closest_end:
+                closest_end = cd_end
+                closest_phone = sim.get("phoneNumber", "?")
+        if closest_end is None:
+            return False
+        seconds = (closest_end - now).total_seconds()
+        wake = closest_end.strftime("%Y-%m-%d %H:%M:%S UTC")
+        log(f"Resting {self._fmt_rest_duration(seconds)} until {wake} (closest cooldown {closest_phone})", "info")
+        try:
+            _post_to_server("notify.php", {
+                "bot_id": BOT_ID,
+                "type": "Resting",
+                "message": f"Resting {self._fmt_rest_duration(seconds)} — closest cooldown {closest_phone} ends {wake} on {self.proxy_email}",
+                "details": {"proxy": self.proxy_email, "phone": closest_phone,
+                            "sleep_seconds": int(seconds), "until": closest_end.isoformat()},
+                "priority": "medium",
+            })
+        except Exception:
+            pass
+        # sleep in <=10s slices so heartbeat + commands keep flowing
+        try:
+            while getattr(self, "running", True):
+                remaining = (closest_end - datetime.now(timezone.utc)).total_seconds()
+                if remaining <= 0:
+                    break
+                try:
+                    _post_to_server("heartbeat.php", {
+                        "bot_id": BOT_ID,
+                        "proxy_email": getattr(self, "noted_proxy", None) or getattr(self, "proxy_email", None),
+                        "poll_inbox": getattr(self, "poll_inbox", None),
+                        "state": "Resting",
+                        "sims_count": getattr(self, "stored_verification_count", 0),
+                        "current_url": self.driver.current_url if hasattr(self.driver, "current_url") else "",
+                    })
+                except Exception:
+                    pass
+                try:
+                    self._poll_commands()
+                except Exception:
+                    pass
+                time.sleep(min(10.0, max(1.0, remaining)))
+        finally:
+            log("Rest finished - cooldowns elapsed, re-checking SIMs", "ok")
+        return True
+
     def api_pair_session(self):
         log("API PAIRING", "info")
         token = self._get_bearer_token()
@@ -911,10 +994,20 @@ class SiteBot:
                     "isMax": int(sim_obj.get("testsInCycle", 0) or 0) >= 8,
                     "isCurrent": sim_obj.get("id") == getattr(self, "current_sim_id", None)
                 })
+            self._sims_detail = detail
             _post_to_server("sims_status.php", {"bot_id": BOT_ID, "sims": detail, "proxy_email": self.proxy_email})
+            self._last_sims_push = time.time()
         except Exception as e:
             log(f"sims_status post failed: {e}", "warn")
         if not available_sims:
+            # per-bot rest: routing.json entry with "rest": true -> sleep until earliest cooldown
+            try:
+                _, _, _rest_entry = self.get_proxy_email_and_inbox()
+                if _rest_entry.get("rest"):
+                    if self.rest_until_next_cooldown(sims_raw):
+                        return False
+            except Exception as _re:
+                log(f"rest check failed: {_re}", "warn")
             log("No SIMs with available slots (all 8/8 or cooldown) — emitting NoNumbersToTest high", "warn")
             try:
                 _post_to_server("notify.php", {
@@ -926,7 +1019,7 @@ class SiteBot:
                 })
             except Exception:
                 pass
-            time.sleep(5)
+            time.sleep(2)
             return False
         if getattr(self, "current_sim_id", None):
             sim = None
@@ -1594,7 +1687,7 @@ class SiteBot:
         except Exception:
             pass
         # avoid spam: sleep a bit before next tick re-notifies
-        time.sleep(5)
+        time.sleep(2)
         return True
 
     def do_confirm_session(self):
@@ -2380,20 +2473,37 @@ class SiteBot:
             log(f"license_select: Continue click failed: {e}", "error")
             return False
 
-    def _select_country_us(self):
-        # Helper: open country dropdown and pick US / United States — robust for react-select / shadcn
+    def _routing_country(self, default="US"):
+        """Country tag from routing.json (\"country\": \"US\"|\"CA\") — used when registering."""
+        try:
+            _, _, entry = self.get_proxy_email_and_inbox()
+            c = str((entry or {}).get("country") or "").upper()
+            if c in ("US", "CA"):
+                return c
+        except Exception:
+            pass
+        return default
+
+    def _select_country(self, code=None):
+        # Helper: open country dropdown and pick US/CA — robust for react-select / shadcn.
+        # code comes from the routing.json country tag (US/CA); defaults to US.
+        code = (code or self._routing_country()).upper()
+        code = code if code in ("US", "CA") else "US"
+        label = "Canada" if code == "CA" else "United States"
+        label_alts = ["Canada", "CA -"] if code == "CA" else ["United States", "US -", "United States of America"]
+        js_texts = ["Canada"] if code == "CA" else ["United States", "United States of America"]
         try:
             time.sleep(0.8)
-            # 1) try JS to find clickable US option directly (even without opening dropdown)
+            # 1) try JS to find clickable option directly (even without opening dropdown)
             try:
                 js = """
                 var t=null;
-                var texts=['United States','United States of America'];
+                var texts=%s;
                 var all=document.querySelectorAll('*');
                 for(var i=0;i<all.length;i++){
                   var el=all[i];
                   var txt=(el.innerText||'').trim();
-                  if(txt==='United States' || txt.startsWith('United States')){
+                  if(txt==='%s' || txt.startsWith('%s')){
                     // must be selectable option (not heading)
                     if(el.tagName==='DIV' || el.tagName==='LI' || el.tagName==='BUTTON'){
                       t=el; break;
@@ -2402,14 +2512,14 @@ class SiteBot:
                 }
                 if(t){ t.scrollIntoView({block:'center'}); t.click(); return t.innerText; }
                 return null;
-                """
+                """ % (json.dumps(js_texts), label, label)
                 res = self.driver.execute_script(js)
-                if res and "United States" in str(res):
-                    log(f"_select_country_us: JS direct click '{res[:30]}'", "ok")
+                if res and label in str(res):
+                    log(f"_select_country: JS direct click '{res[:30]}'", "ok")
                     time.sleep(0.8)
                     return True
             except Exception as e:
-                log(f"_select_country_us JS direct failed: {e}", "warn")
+                log(f"_select_country({code}) JS direct failed: {e}", "warn")
             # 2) open dropdown trigger
             trigger = None
             for sel in ['button', 'div[role="combobox"]', 'input[placeholder*="country" i]', 'div[class*="select"]']:
@@ -2418,7 +2528,7 @@ class SiteBot:
                     for el in els:
                         try:
                             txt = (el.text or "") + (el.get_attribute("placeholder") or "") + (el.get_attribute("aria-label") or "")
-                            if "Choose a country" in txt or "Select your country" in txt or "country" in txt.lower() or "United States" in txt:
+                            if "Choose a country" in txt or "Select your country" in txt or "country" in txt.lower() or label in txt:
                                 trigger = el
                                 break
                         except: continue
@@ -2438,23 +2548,23 @@ class SiteBot:
                 except: pass
                 self.click(trigger, label="country dropdown")
                 time.sleep(1.2)
-            # 3) wait for options list to appear and pick US
+            # 3) wait for options list to appear and pick target country
             for attempt in range(3):
                 us_opt = None
-                for txt in ["United States", "US -", "United States of America"]:
+                for txt in label_alts:
                     us_opt = self.find_button_with_text(txt)
                     if us_opt: break
                 if us_opt is None:
                     for el in self.driver.find_elements(By.TAG_NAME, "div"):
                         try:
-                            if (el.text or "").strip() == "United States":
+                            if (el.text or "").strip() == label:
                                 us_opt = el
                                 break
                         except: continue
                 if us_opt is None:
                     for el in self.driver.find_elements(By.TAG_NAME, "li"):
                         try:
-                            if "United States" in (el.text or ""):
+                            if label in (el.text or ""):
                                 us_opt = el
                                 break
                         except: continue
@@ -2462,21 +2572,24 @@ class SiteBot:
                     try:
                         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", us_opt)
                     except: pass
-                    self.click(us_opt, label="US option")
+                    self.click(us_opt, label=f"{code} option")
                     time.sleep(0.8)
                     # confirm selection stuck (dropdown closed)
                     try:
-                        # check if trigger now shows United States
+                        # check if trigger now shows the country
                         body = self.get_body_text()
-                        if "United States" in body:
+                        if label in body:
                             return True
                     except: pass
                     return True
                 time.sleep(0.6)
-            log("_select_country_us: US option not found after opening", "warn")
+            log(f"_select_country({code}): {label} option not found after opening", "warn")
         except Exception as e:
-            log(f"_select_country_us failed: {e}", "warn")
+            log(f"_select_country({code}) failed: {e}", "warn")
         return False
+
+    def _select_country_us(self):
+        return self._select_country("US")
 
     def _click_continue(self, label="Continue"):
         for txt in [label, "Continue", "Next", "Continue as Scout", "Continue as Runner"]:
@@ -2553,8 +2666,9 @@ class SiteBot:
             return False
 
     def do_country_select(self):
-        log("STATE: country_select - selecting US", "info")
-        self._select_country_us()
+        code = self._routing_country()
+        log(f"STATE: country_select - selecting {code} (routing tag)", "info")
+        self._select_country(code)
         time.sleep(0.5)
         self._click_continue("Continue")
         return True
@@ -2568,8 +2682,9 @@ class SiteBot:
         return True
 
     def do_country_role_select(self):
-        log("STATE: country_role_select - US + Scout", "info")
-        self._select_country_us()
+        code = self._routing_country()
+        log(f"STATE: country_role_select - {code} + Scout (routing tag)", "info")
+        self._select_country(code)
         time.sleep(0.5)
         btn = self.find_button_with_text("Continue as Scout")
         if btn is None: btn = self.find_button_with_text("Scout")
@@ -2913,8 +3028,8 @@ class SiteBot:
                     log(f"step_click fallback failed: {e2}", "warn")
             if not ok:
                 # All 8/8 or no pairs -> already emitted NoNumbersToTest high in api_pair; break loop by returning to dashboard for fresh SIM check
-                log(f"test_numbers_available: no pair created (last number tried: {getattr(self, 'last_pair_number', '?')}) -> back to dashboard for SIM re-check (throttle 15s)", "warn")
-                time.sleep(15)
+                log(f"test_numbers_available: no pair created (last number tried: {getattr(self, 'last_pair_number', '?')}) -> back to dashboard for SIM re-check (throttle 8s)", "warn")
+                time.sleep(8)
                 try:
                     self.driver.get(cfg.BASE_URL + "/scout")
                     time.sleep(2)
@@ -3149,17 +3264,52 @@ class SiteBot:
 
     # -- server-coordinated helpers (command polling) ----------------------
 
+    def _sync_auth_token(self):
+        """Auto-post auth_token to server every ~30s (only when changed) so the
+        dashboard Devices table fills itself without pressing Load tokens."""
+        now = time.time()
+        if now - getattr(self, "_last_token_sync", 0) < 30:
+            return
+        self._last_token_sync = now
+        if not SERVER_URL:
+            return
+        try:
+            token = _extract_auth_token(self.driver)
+        except Exception:
+            return
+        if not token or token == getattr(self, "_last_token_posted", None):
+            return
+        try:
+            r = requests.post(
+                f"{SERVER_URL}/bot_token.php",
+                json={
+                    "bot_id": BOT_ID,
+                    "token": token,
+                    "proxy_email": getattr(self, "proxy_email", None),
+                    "poll_inbox": getattr(self, "poll_inbox", None),
+                },
+                headers={"X-Bot-Token": BOT_TOKEN},
+                timeout=5,
+            )
+            if r.ok:
+                self._last_token_posted = token
+                log(f"[token] auto-posted ...{token[-8:]}", "ok")
+            else:
+                log(f"[token] auto-post failed http={r.status_code} {r.text[:120]}", "warn")
+        except Exception as e:
+            log(f"[token] auto-post exception: {e}", "warn")
+
     def _poll_commands(self):
-        """Poll server for pending commands every 2-3s (called at start of tick).
+        """Poll server for pending commands every ~1s (called at start of tick).
         Handles get_auth_token and refresh without blocking tick.
         """
         now = time.time()
-        if now - getattr(self, "_last_command_poll", 0) < 2.5:
+        if now - getattr(self, "_last_command_poll", 0) < 1.0:
             return
         self._last_command_poll = now
         try:
             url = f"{SERVER_URL.rstrip('/')}/command.php"
-            r = requests.get(url, params={"bot_id": BOT_ID}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+            r = requests.get(url, params={"bot_id": BOT_ID}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=1.5)
             if not r.ok:
                 return
             data = r.json()
@@ -3436,6 +3586,13 @@ class SiteBot:
                                         if inp:
                                             self.type_into(inp, phone, label="phone")
                                             time.sleep(0.6)
+                                        # country tag from routing.json (US/CA) — set if the form exposes one
+                                        try:
+                                            _cc = self._routing_country()
+                                            log(f"REGISTER_UI: country tag {_cc}", "info")
+                                            self._select_country(_cc)
+                                        except Exception as _ce:
+                                            log(f"REGISTER_UI country select skipped: {_ce}", "warn")
                                         # carrier/country may be auto, try to find carrier input
                                         # Click Add/Submit
                                         btn=self.find_button_with_text("Add SIM") or self.find_button_with_text("Add") or self.find_button_with_text("Submit") or self.find_button_with_text("Continue")
@@ -3585,33 +3742,61 @@ class SiteBot:
         self._supab_cap_last = sess["access_token"]
         log(f"supabase session posted ...{sess['access_token'][-8:]} refresh={'yes' if sess.get('refresh_token') else 'no'}", "ok")
 
+    def _push_sims_status(self, force=False):
+        """Re-post the last known SIM detail so the fleet progress bar stays current.
+
+        api_pair_session only runs when the bot re-enters test_numbers_list; without
+        this the bar freezes between visits. 5s throttle (force bypasses it).
+        """
+        detail = getattr(self, "_sims_detail", None)
+        if not detail:
+            return False
+        if not force and time.time() - getattr(self, "_last_sims_push", 0) < 5.0:
+            return False
+        self._last_sims_push = time.time()
+        _post_to_server("sims_status.php", {"bot_id": BOT_ID, "sims": detail, "proxy_email": getattr(self, "proxy_email", None)})
+        return True
+
     def tick(self):
-        # Poll server commands first (non-blocking, every ~2.5s)
+        # Poll server commands first (non-blocking, every ~1s)
         try:
             self._poll_commands()
         except Exception as e:
             log(f"poll_commands exception: {e}", "warn")
         state = self.identify_state()
         log(f"[state] {state}")
-        # heartbeat to comms server (silent fail so bot never dies if server down)
+        # heartbeat to comms server (silent fail so bot never dies if server down);
+        # throttled to 2s so faster ticks don't hammer state.php
+        if time.time() - getattr(self, "_last_hb", 0) >= 2.0:
+            self._last_hb = time.time()
+            try:
+                _proxy = getattr(self, "noted_proxy", None) or getattr(self, "proxy_email", None)
+                _poll = getattr(self, "poll_inbox", None)
+                if not _proxy:
+                    try:
+                        _proxy, _poll, _ = self.get_proxy_email_and_inbox()
+                    except Exception:
+                        pass
+                _post_to_server("heartbeat.php", {
+                    "bot_id": BOT_ID,
+                    "proxy_email": _proxy,
+                    "poll_inbox": _poll,
+                    "state": state,
+                    "sims_count": getattr(self, "stored_verification_count", 0),
+                    "current_url": self.driver.current_url if hasattr(self.driver, "current_url") else ""
+                })
+            except Exception as e:
+                log(f"heartbeat post failed: {e}", "warn")
+        # keep the dashboard progress bar fresh (re-posts cached SIM detail, 10s throttle)
         try:
-            _proxy = getattr(self, "noted_proxy", None) or getattr(self, "proxy_email", None)
-            _poll = getattr(self, "poll_inbox", None)
-            if not _proxy:
-                try:
-                    _proxy, _poll, _ = self.get_proxy_email_and_inbox()
-                except Exception:
-                    pass
-            _post_to_server("heartbeat.php", {
-                "bot_id": BOT_ID,
-                "proxy_email": _proxy,
-                "poll_inbox": _poll,
-                "state": state,
-                "sims_count": getattr(self, "stored_verification_count", 0),
-                "current_url": self.driver.current_url if hasattr(self.driver, "current_url") else ""
-            })
+            self._push_sims_status()
+        except Exception:
+            pass
+        # auto-post auth token so dashboard never needs manual Load tokens
+        try:
+            self._sync_auth_token()
         except Exception as e:
-            log(f"heartbeat post failed: {e}", "warn")
+            log(f"token auto-post failed: {e}", "warn")
         # keep server's supabase session fresh (create-code / UP balance need it)
         try:
             self.refresh_supabase_capture()
@@ -4052,7 +4237,7 @@ def run():
             except Exception as ne:
                 log(f"notify post failed: {ne}", "warn")
             # Keep chrome open, sleep and retry (server can detect via logs)
-            time.sleep(60)
+            time.sleep(5)
             continue
         except SystemExit as e:
             log(f"Exit: {e}", "warn")
@@ -4068,7 +4253,7 @@ def run():
                 if action == "giveup":
                     break
                 continue
-            time.sleep(5)
+            time.sleep(2)
 
     log("Bot stopped", "ok")
     try:
