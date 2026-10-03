@@ -336,7 +336,6 @@ def random_delay():
         delay = random.uniform(cfg.LONG_PAUSE_MIN, cfg.LONG_PAUSE_MAX)
     else:
         delay = random.uniform(cfg.STEP_DELAY_MIN, cfg.STEP_DELAY_MAX)
-    time.sleep(delay)
     return delay
 
 
@@ -2558,7 +2557,7 @@ class SiteBot:
 
         if fetch_fn is not None:
             try:
-                otp_code = fetch_fn(proxy_email, poll_inbox, timeout=60, poll_interval=3)
+                otp_code = fetch_fn(proxy_email, poll_inbox, timeout=60, poll_interval=1.5)
             except Exception as e:
                 # Handle IMAP errors gracefully - log and continue to fallback
                 log(f"otp_verification: IMAP fetch_otp exception for {proxy_email} via {poll_inbox}: {e}", "error")
@@ -2571,7 +2570,7 @@ class SiteBot:
                     except ValueError:
                         bid = 0
                     log("otp_verification: trying fallback fetch_otp_for_bot...", "warn")
-                    otp_code = _fallback(bot_id=bid, timeout=60, poll_interval=3)
+                    otp_code = _fallback(bot_id=bid, timeout=60, poll_interval=1.5)
                 except Exception as fe:
                     log(f"otp_verification: fallback also failed: {fe}", "error")
         else:
@@ -2582,7 +2581,7 @@ class SiteBot:
                     bid = int(os.getenv("BOT_ID", str(BOT_ID)) or "0")
                 except ValueError:
                     bid = 0
-                otp_code = fetch_otp_for_bot(bot_id=bid, timeout=60, poll_interval=3)
+                otp_code = fetch_otp_for_bot(bot_id=bid, timeout=60, poll_interval=1.5)
             except Exception as e:
                 log(f"otp_verification: fallback fetch_otp_for_bot failed: {e}", "error")
                 self.log.error("otp_verification fallback failed", details={"error": str(e), "proxy": proxy_email, "poll_inbox": poll_inbox})
