@@ -89,13 +89,15 @@ for ID in $IDS; do
     --shm-size=512m \
     --add-host=host.docker.internal:host-gateway \
     -e BOT_ID="$ID" \
+    -p "$((5900 + ID)):5900" \
+    -p "$((6080 + ID)):6080" \
     -p "$((9222 + ID)):9222" \
     -v "$DATA_DIR/data:/app/data" \
     -v "$DATA_DIR/logs:/app/logs" \
     "${ENV_ARGS[@]}" \
     "$IMAGE" >/dev/null
 
-  echo "[ok] $NAME up  proxy=$PROXY  chrome=:$((9222 + ID))"
+  echo "[ok] $NAME up  proxy=$PROXY  vnc=:$((6080 + ID))  chrome=:$((9222 + ID))"
 done
 
 echo ""
