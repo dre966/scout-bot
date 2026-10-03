@@ -185,12 +185,5 @@
         "domain": "blizz-media.website",
         "type": "forward",
         "country": "CA"
-    },
-    {
-        "proxy": "titcheck@cultinet.site",
-        "poll_inbox": "faxcheck2@gmail.com",
-        "domain": "cultinet.site",
-        "type": "forward",
-        "country": "US"
     }
 ]
