@@ -68,6 +68,28 @@ def _post_to_server(endpoint, payload):
         log(f"server post {endpoint} failed: {e}", "warn")
 
 
+def _container_stats():
+    """cgroup v2 memory + CPU-throttle snapshot for this container (Railway
+    panels show these, but a line in the app's Live logs makes it visible
+    per-bot). Returns None if cgroup files aren't readable."""
+    try:
+        cur = int(open("/sys/fs/cgroup/memory.current").read().strip())
+        raw_max = open("/sys/fs/cgroup/memory.max").read().strip()
+        mx = int(raw_max) if raw_max.isdigit() else 0
+        usage = throttled = 0
+        for line in open("/sys/fs/cgroup/cpu.stat"):
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "usage_usec":
+                usage = int(parts[1])
+            elif len(parts) == 2 and parts[0] == "throttled_usec":
+                throttled = int(parts[1])
+        pct = round(100.0 * throttled / max(usage, 1), 1)
+        mem = f"mem {cur // 2**20}/{mx // 2**20 if mx else '?'}MB"
+        return f"{mem} cpu_throttle {pct}%"
+    except Exception:
+        return None
+
+
 def _server_log(msg):
     """Push a line to server bot_logs - shows up on the app's Live page."""
     _post_to_server("heartbeat.php", {"bot_id": BOT_ID, "message": msg})
@@ -4258,6 +4280,10 @@ class SiteBot:
                         _proxy, _poll, _ = self.get_proxy_email_and_inbox()
                     except Exception:
                         pass
+                _stats = None
+                if time.time() - getattr(self, "_last_mem_log", 0) >= 60:
+                    self._last_mem_log = time.time()
+                    _stats = _container_stats()
                 _post_to_server("heartbeat.php", {
                     "bot_id": BOT_ID,
                     "proxy_email": _proxy,
@@ -4265,7 +4291,8 @@ class SiteBot:
                     "state": state,
                     "sims_count": getattr(self, "stored_verification_count", 0),
                     "current_url": self.driver.current_url if hasattr(self.driver, "current_url") else "",
-                    "ip": get_public_ip()
+                    "ip": get_public_ip(),
+                    "message": _stats
                 })
             except Exception as e:
                 log(f"heartbeat post failed: {e}", "warn")
@@ -4627,6 +4654,14 @@ def connect_to_chrome(port=None):
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--enable-unsafe-swiftshader")
+    # Lean on RAM/CPU: Railway bots run in 1GB cgroups — cap renderer
+    # processes, kill background features, keep the tab hot (no bg throttling).
+    opts.add_argument("--renderer-process-limit=2")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-background-timer-throttling")
+    opts.add_argument("--disable-renderer-backgrounding")
+    opts.add_argument("--disable-features=BackForwardCache,Translate,OptimizationHints,MediaRouter,CalculateNativeWinOcclusion")
+    opts.add_argument("--disk-cache-size=10485760")
     opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
     opts.add_argument("--user-data-dir=/tmp/chrome-bot-profile")
     try:
