@@ -7,12 +7,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg2 \
     unzip \
     curl \
-    xvfb \
-    x11vnc \
-    xauth \
-    novnc \
-    websockify \
-    supervisor \
     ca-certificates \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg \
@@ -37,11 +31,9 @@ COPY . .
 
 RUN chmod +x /usr/local/bin/chromedriver
 
-ENV DISPLAY=:99
 ENV PYTHONUNBUFFERED=1
-ENV CHROME_FLAGS="--remote-debugging-port=9222 --no-sandbox --disable-gpu --window-size=1920,1080"
 
-EXPOSE 9222 5900 6080
+EXPOSE 9222
 
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh

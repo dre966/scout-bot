@@ -68,6 +68,11 @@ def _post_to_server(endpoint, payload):
         log(f"server post {endpoint} failed: {e}", "warn")
 
 
+def _server_log(msg):
+    """Push a line to server bot_logs - shows up on the app's Live page."""
+    _post_to_server("heartbeat.php", {"bot_id": BOT_ID, "message": msg})
+
+
 def _get_from_server(endpoint, params=None):
     """GET from comms server with auth. Returns parsed JSON or None on fail. No-op if SERVER_URL not set."""
     if not SERVER_URL:
@@ -511,13 +516,13 @@ class SiteBot:
                 return True
             except StaleElementReferenceException:
                 if attempt < retries:
-                    time.sleep(0.3)
+                    time.sleep(cfg.SLEEP_SHORT)
                     continue
                 self.stale_error_count += 1
                 return False
             except ElementClickInterceptedException:
                 if attempt < retries:
-                    time.sleep(0.8)
+                    time.sleep(cfg.SLEEP_FAST)
                     try:
                         self.driver.execute_script("arguments[0].click();", element)
                         self.stale_error_count = 0
@@ -700,31 +705,31 @@ class SiteBot:
             if profile_btn is not None:
                 try:
                     self.click(profile_btn, label="profile menu")
-                    time.sleep(1)
+                    time.sleep(cfg.SLEEP_TAP)
                 except Exception:
                     try:
                         self.driver.execute_script("arguments[0].click();", profile_btn)
-                        time.sleep(1)
+                        time.sleep(cfg.SLEEP_TAP)
                     except Exception:
                         pass
                 switch_btn = self.find_button_with_text("Switch to Scout")
                 if switch_btn is not None:
                     log("_switch_to_scout: clicking Switch to Scout", "info")
                     self.click(switch_btn, label="Switch to Scout")
-                    time.sleep(3)
+                    time.sleep(cfg.SLEEP_LONG)
                     self.driver.get(cfg.TEST_NUMBERS_PAGE_URL)
-                    time.sleep(2)
+                    time.sleep(cfg.SLEEP_PAUSE)
                     return
                 if switch_btn is None:
                     log("_switch_to_scout: no Switch to Scout button, already Scout or modal not open", "info")
             self.driver.get(cfg.TEST_NUMBERS_PAGE_URL)
-            time.sleep(2)
+            time.sleep(cfg.SLEEP_PAUSE)
         except Exception as e:
             log(f"_switch_to_scout failed: {e}", "warn")
             try:
                 fallback = getattr(cfg, "SCOUT_DASHBOARD_URL", None) or (cfg.BASE_URL + "/scout")
                 self.driver.get(fallback)
-                time.sleep(2)
+                time.sleep(cfg.SLEEP_PAUSE)
             except Exception as e2:
                 log(f"_switch_to_scout fallback failed: {e2}", "warn")
 
@@ -748,26 +753,446 @@ class SiteBot:
             if profile_btn is not None:
                 try:
                     self.click(profile_btn, label="profile menu")
-                    time.sleep(1)
+                    time.sleep(cfg.SLEEP_TAP)
                 except Exception:
                     try:
                         self.driver.execute_script("arguments[0].click();", profile_btn)
-                        time.sleep(1)
+                        time.sleep(cfg.SLEEP_TAP)
                     except Exception:
                         pass
                 switch_btn = self.find_button_with_text("Switch to Runner")
                 if switch_btn is not None:
                     log("_switch_to_runner: clicking Switch to Runner", "info")
                     self.click(switch_btn, label="Switch to Runner")
-                    time.sleep(3)
+                    time.sleep(cfg.SLEEP_LONG)
                     self.driver.get(cfg.BASE_URL + "/runner")
-                    time.sleep(2)
+                    time.sleep(cfg.SLEEP_PAUSE)
                     return
                 log("_switch_to_runner: no Switch to Runner button, already Runner", "info")
             self.driver.get(cfg.BASE_URL + "/runner")
-            time.sleep(2)
+            time.sleep(cfg.SLEEP_PAUSE)
         except Exception as e:
             log(f"_switch_to_runner failed: {e}", "warn")
+
+    # -- auto-add SIMs via runner role (when account has 0 SIMs) ----------
+
+    def _load_pending_sims(self):
+        """Phone numbers waiting to be registered for this bot (data/sims.json)."""
+        try:
+            with open("data/sims.json", "r") as f:
+                data = json.load(f)
+            sims = data.get(str(BOT_ID)) or data.get(f"acc{BOT_ID}") or []
+            if sims and isinstance(sims[0], dict):
+                sims = [s.get("phoneNumber") or s.get("phone") for s in sims]
+            return [s for s in sims if s]
+        except Exception as e:
+            log(f"autoadd: data/sims.json load failed: {e}", "warn")
+            return []
+
+    def _existing_account_sims(self):
+        """Phone numbers already registered on this account (page text + runner
+        API). Best-effort; returns an empty set when it cannot be determined."""
+        found = set()
+        try:
+            for m in re.findall(r"\+\d{8,15}", self.get_body_text()):
+                found.add(m.lstrip("+"))
+        except Exception:
+            pass
+        try:
+            tok = self.driver.execute_script(
+                "try{var s=localStorage.getItem('cv-auth-storage');if(!s)return '';"
+                "var st=JSON.parse(s);return (st.state&&st.state.token)||'';}catch(e){return '';}")
+            if tok:
+                from curl_cffi import requests as cffi_requests
+                r = cffi_requests.get(
+                    "https://scoutandrunner.com/api/runner/sims",
+                    headers={"accept": "application/json",
+                             "authorization": "Bearer " + str(tok),
+                             "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                           "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"},
+                    impersonate="chrome", timeout=10)
+                if r.ok:
+                    data = r.json()
+                    items = data if isinstance(data, list) else (
+                        data.get("sims") or data.get("data") or [])
+                    for s in items:
+                        if not isinstance(s, dict):
+                            continue
+                        obj = s.get("sim") if isinstance(s.get("sim"), dict) else s
+                        ph = str(obj.get("phoneNumber") or obj.get("phone") or "").strip().lstrip("+")
+                        if ph.isdigit() and len(ph) >= 8:
+                            found.add(ph)
+                else:
+                    log(f"existing sims: runner api http {r.status_code}", "warn")
+        except Exception as e:
+            log(f"existing sims: api check failed: {e}", "warn")
+        return found
+
+    def _register_sims_via_ui(self, sims):
+        """Wizard: Add SIM -> Select Package -> Next -> phone -> Register
+        (page fires its own reCAPTCHA) -> OTP via esimplus -> verify ->
+        Skip package. Skips numbers already on the account, stops after 2
+        consecutive failures. Sets _last_add_summary. Returns True if >=1 verified."""
+        import re as _re
+        esim_headers = {
+            "accept": "*/*",
+            "accept-language": "en-US,en;q=0.9",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+        }
+        pending = []
+        for phone in sims:
+            if isinstance(phone, dict):
+                phone = phone.get("phoneNumber") or phone.get("phone")
+            if phone:
+                pending.append(str(phone).strip().lstrip("+"))
+        pending = [p for p in pending if p]
+        try:
+            self.driver.get("https://scoutandrunner.com/runner/sims")
+            time.sleep(cfg.SLEEP_PAUSE)
+        except Exception:
+            pass
+        tok = ""
+        try:
+            tok = self.driver.execute_script(
+                "try{var s=localStorage.getItem('cv-auth-storage');if(!s)return '';"
+                "var st=JSON.parse(s);return (st.state&&st.state.token)||'';}catch(e){return '';}")
+        except Exception:
+            pass
+        if not tok:
+            self._last_add_summary = "session logged out - wait for re-login, then retry"
+            log("REGISTER_UI: not logged in (no session token) - aborting", "warn")
+            return False
+        before = self._existing_account_sims()
+        phones = [p for p in pending if p not in before]
+        skipped_n = len(pending) - len(phones)
+        consec = 0
+        self._phone_ok = None
+        log(f"REGISTER_UI: {len(before)} sim(s) on account, {len(pending)} pending, "
+            f"{skipped_n} skipped", "info")
+        for phone in phones:
+            digits = phone
+            prev_ok = self._phone_ok
+            self._phone_ok = None
+            if prev_ok is True:
+                consec = 0
+            elif prev_ok is False:
+                consec += 1
+                if consec >= 2:
+                    log("REGISTER_UI: 2 consecutive failures - stopping", "warn")
+                    break
+            self._phone_ok = False
+            log(f"REGISTER_UI: adding {digits}", "info")
+            try:
+                self.driver.get("https://scoutandrunner.com/runner/sims")
+                time.sleep(cfg.SLEEP_PAUSE)
+                add_btn = None
+                for _att in range(12):
+                    add_btn = self.find_button_with_text("Add SIM")
+                    if add_btn:
+                        break
+                    if _att == 5:
+                        try:
+                            self.driver.refresh()
+                            time.sleep(cfg.SLEEP_PAUSE)
+                        except Exception:
+                            pass
+                    time.sleep(cfg.SLEEP_TAP)
+                if not add_btn:
+                    log(f"REGISTER_UI {digits} no Add SIM button url={self.driver.current_url} "
+                        f"body={self.get_body_text()[:120]}", "warn")
+                    continue
+                self.click(add_btn, label="Add SIM")
+                time.sleep(cfg.SLEEP_LONG)
+
+                sel = None
+                for _ in range(10):
+                    sel = self.find_button_with_text("Select Package")
+                    if sel:
+                        break
+                    time.sleep(cfg.SLEEP_TAP)
+                if not sel:
+                    log(f"REGISTER_UI {digits} no Select Package button", "warn")
+                    continue
+                self.click(sel, label="Select Package")
+                time.sleep(cfg.SLEEP_MED)
+
+                def visible_inputs():
+                    out = []
+                    try:
+                        for el in self.driver.find_elements(By.CSS_SELECTOR, "input"):
+                            try:
+                                if el.is_displayed() and el.is_enabled():
+                                    out.append(el)
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                    return out
+
+                tel = None
+                for _ in range(10):
+                    for v in visible_inputs():
+                        if (v.get_attribute("type") or "text") == "tel":
+                            tel = v
+                            break
+                    if tel:
+                        break
+                    nxt = self.find_button_with_text("Next")
+                    if nxt:
+                        try:
+                            if nxt.is_enabled():
+                                self.click(nxt, label="Next")
+                        except Exception:
+                            pass
+                    time.sleep(cfg.SLEEP_MED)
+                if tel is None:
+                    log(f"REGISTER_UI {digits} no phone input", "warn")
+                    continue
+                self.type_into(tel, digits, label="phone")
+                time.sleep(cfg.SLEEP_MED)
+
+                esim_url = f"https://esimplus.me/api/sms-receiver/{digits}/sms?perPage=18"
+                seen = set()
+                try:
+                    from curl_cffi import requests as cffi_requests
+                    r = cffi_requests.get(esim_url, headers=esim_headers, impersonate="chrome", timeout=10)
+                    if r.ok:
+                        for m in r.json().get("data", []):
+                            seen.add(m.get("body", ""))
+                except Exception:
+                    pass
+
+                reg = None
+                for _ in range(15):
+                    cand = self.find_button_with_text("Register")
+                    if cand:
+                        try:
+                            if cand.is_enabled():
+                                reg = cand
+                                break
+                        except Exception:
+                            pass
+                    time.sleep(cfg.SLEEP_TAP)
+                if reg is None:
+                    body = self.get_body_text().lower()
+                    if body.strip().startswith("login"):
+                        log(f"REGISTER_UI {digits} session dropped to login page - stopping", "warn")
+                        self._last_sec_fail = time.time()
+                        break
+                    if "already" in body:
+                        log(f"REGISTER_UI {digits} already registered", "warn")
+                    elif "security" in body:
+                        log(f"REGISTER_UI {digits} security/captcha fail before register", "warn")
+                        self._last_sec_fail = time.time()
+                    else:
+                        log(f"REGISTER_UI {digits} no Register button", "warn")
+                    continue
+                self.click(reg, label="Register")
+                time.sleep(cfg.SLEEP_LONG)
+
+                otp_boxes, single = [], None
+                for _ in range(15):
+                    m1 = [v for v in visible_inputs()
+                          if (v.get_attribute("maxlength") or "") == "1"]
+                    if len(m1) >= 6:
+                        otp_boxes = m1[:6]
+                        break
+                    vis = [v for v in visible_inputs()
+                           if (v.get_attribute("type") or "text") not in ("email", "tel")
+                           and "@" not in (v.get_attribute("value") or "")]
+                    non_email = [v for v in visible_inputs()
+                                 if (v.get_attribute("type") or "text") not in ("email", "tel")]
+                    if len(vis) >= 6:
+                        otp_boxes = vis[:6]
+                        break
+                    if len(non_email) == 1:
+                        single = non_email[0]
+                        break
+                    body = self.get_body_text().lower()
+                    if "already" in body or "too many" in body or "security" in body:
+                        break
+                    time.sleep(cfg.SLEEP_TAP)
+                if not otp_boxes and not single:
+                    body = self.get_body_text().lower()
+                    if body.strip().startswith("login"):
+                        log(f"REGISTER_UI {digits} session dropped to login page - stopping", "warn")
+                        self._last_sec_fail = time.time()
+                        break
+                    if "already" in body:
+                        log(f"REGISTER_UI {digits} already registered", "warn")
+                    elif "security" in body:
+                        log(f"REGISTER_UI {digits} captcha/security fail (no OTP step) "
+                            f"body={self.get_body_text()[:200]}", "warn")
+                        self._last_sec_fail = time.time()
+                    elif "too many" in body:
+                        log("REGISTER_UI too many requests, stopping", "warn")
+                        break
+                    else:
+                        log(f"REGISTER_UI {digits} no OTP step; body={self.get_body_text()[:150]}", "warn")
+                    continue
+
+                code = None
+                try:
+                    from curl_cffi import requests as cffi_requests
+                    end = time.time() + 90
+                    while time.time() < end and not code:
+                        r = cffi_requests.get(esim_url, headers=esim_headers, impersonate="chrome", timeout=10)
+                        if r.ok:
+                            for m in r.json().get("data", []):
+                                b = m.get("body", "")
+                                if b in seen or "apex" not in b.lower():
+                                    continue
+                                mm = _re.search(r"\b(\d{5,6})\b", b)
+                                if mm:
+                                    code = mm.group(1)
+                                    break
+                        if code:
+                            break
+                        time.sleep(cfg.SLEEP_WAIT)
+                except Exception as e:
+                    log(f"REGISTER_UI esimplus poll failed: {e}", "warn")
+                if not code:
+                    log(f"REGISTER_UI {digits} no OTP received", "warn")
+                    continue
+                if otp_boxes:
+                    for i, ch in enumerate(str(code)):
+                        try:
+                            otp_boxes[i].send_keys(ch)
+                        except Exception:
+                            pass
+                else:
+                    self.type_into(single, code, label="otp")
+                time.sleep(cfg.SLEEP_SMALL)
+                vbtn = (self.find_button_with_text("Verify")
+                        or self.find_button_with_text("Continue")
+                        or self.find_button_with_text("Submit"))
+                if vbtn:
+                    self.click(vbtn, label="Verify OTP")
+                    time.sleep(cfg.SLEEP_LONG)
+
+                body = self.get_body_text().lower()
+                if "verified" in body:
+                    log(f"REGISTER_UI {digits} verified", "ok")
+                    self._phone_ok = True
+                    _server_log(f"[autoadd] {digits} verified via UI")
+                    skip = self.find_button_with_text("Skip for now")
+                    if skip:
+                        self.click(skip, label="Skip for now")
+                        time.sleep(cfg.SLEEP_MED)
+                elif "already" in body:
+                    log(f"REGISTER_UI {digits} already in list", "warn")
+                elif "too many" in body:
+                    log("REGISTER_UI too many requests, stopping", "warn")
+                    break
+                elif "security" in body:
+                    log(f"REGISTER_UI {digits} security/captcha fail", "warn")
+                    self._last_sec_fail = time.time()
+                else:
+                    log(f"REGISTER_UI {digits} uncertain result: {body[:150]}", "warn")
+            except Exception as e:
+                log(f"REGISTER_UI {digits} error: {e}", "warn")
+            time.sleep(cfg.SLEEP_MED)
+        try:
+            self.driver.get("https://scoutandrunner.com/runner/sims")
+            time.sleep(cfg.SLEEP_PAUSE)
+        except Exception:
+            pass
+        after = self._existing_account_sims()
+        added_n = len(after - before)
+        failed_n = len([p for p in phones if p not in after and p not in before])
+        summary = f"{added_n} added, {skipped_n} already on account, {failed_n} failed"
+        self._last_add_summary = summary
+        log(f"REGISTER_UI done: {summary}", "info")
+        try:
+            _server_log(f"[autoadd] {summary}")
+        except Exception:
+            pass
+        return added_n > 0
+
+    def _auto_add_sims(self):
+        """Account has 0 SIMs -> switch to runner, add SIMs via the UI, switch back."""
+        now = time.time()
+        last = getattr(self, "_last_auto_add", 0)
+        if now - last < 1800:
+            log(f"[autoadd] cooldown active ({int(1800 - (now - last))}s left) - skipping", "info")
+            return False
+        sf = getattr(self, "_last_sec_fail", 0)
+        if sf and now - sf < 3600:
+            mins = int((3600 - (now - sf)) / 60) + 1
+            self._last_add_summary = f"security verification failing - blocked {mins}m"
+            log(f"[autoadd] sec-fail backoff: {mins}m left - not retrying", "info")
+            _server_log(f"[autoadd] sec-fail backoff for bot {BOT_ID} ({mins}m left)")
+            return False
+        self._last_auto_add = now
+        log(f"[autoadd] starting UI add via runner role (bot {BOT_ID})", "warn")
+        _server_log(f"[autoadd] switching to runner to add (bot {BOT_ID})")
+        added = False
+        try:
+            try:
+                self._switch_to_runner()
+            except Exception as e:
+                log(f"autoadd: switch to runner failed: {e}", "warn")
+            phones = self._load_pending_sims()
+            if not phones:
+                self._last_add_summary = f"no pending numbers in data/sims.json (bot {BOT_ID})"
+                _server_log(f"[autoadd] no numbers for bot {BOT_ID} (data/sims.json)")
+                return False
+            added = self._register_sims_via_ui(phones)
+        except Exception as e:
+            log(f"[autoadd] error: {e}", "error")
+            self._last_add_summary = f"error: {str(e)[:100]}"
+            _server_log(f"[autoadd] error: {str(e)[:120]}")
+        finally:
+            try:
+                self._switch_to_scout()
+            except Exception as e:
+                log(f"autoadd: switch back to scout failed: {e}", "warn")
+        if added:
+            try:
+                _post_to_server("notify.php", {
+                    "bot_id": BOT_ID,
+                    "type": "SimsAdded",
+                    "message": f"Auto-added SIM on {getattr(self, 'proxy_email', '?')}",
+                    "priority": "normal",
+                })
+            except Exception:
+                pass
+        return added
+
+    def _handle_sims_added(self, args):
+        """SIMs registered outside the bot (local_add_sims.py) - drop them from
+        data/sims.json pending list and report. Returns ack message."""
+        phones = []
+        try:
+            phones = [str(p).strip().lstrip("+") for p in ((args or {}).get("phones") or [])]
+        except Exception:
+            pass
+        removed = 0
+        try:
+            with open("data/sims.json", "r") as f:
+                sj = json.load(f)
+            key = str(BOT_ID)
+            cur = sj.get(key) or sj.get(f"acc{BOT_ID}") or []
+            norm = set(phones)
+            new = [x for x in cur if str(x).strip().lstrip("+") not in norm]
+            removed = len(cur) - len(new)
+            if removed:
+                sj[key] = new
+                with open("data/sims.json", "w") as f:
+                    json.dump(sj, f, indent=4)
+        except Exception as e:
+            log(f"[cmd] SIMS_ADDED pending update failed: {e}", "warn")
+        msg = f"{len(phones)} SIM(s) added locally, {removed} removed from pending"
+        log(f"[cmd] SIMS_ADDED: {msg}", "ok")
+        try:
+            _server_log(f"[localadd] {msg}")
+        except Exception:
+            pass
+        return msg
 
     # -- disposition history helpers (restored from smart_call_yours.py) ----
 
@@ -1000,6 +1425,15 @@ class SiteBot:
         except Exception as e:
             log(f"sims_status post failed: {e}", "warn")
         if not available_sims:
+            # 0 SIMs on the account (empty list) -> switch to runner and add one
+            if not sims_raw:
+                log("0 SIMs on account - auto-adding via runner role", "warn")
+                try:
+                    self._auto_add_sims()
+                except Exception as e:
+                    log(f"autoadd failed: {e}", "error")
+                time.sleep(cfg.SLEEP_PAUSE)
+                return False
             # per-bot rest: routing.json entry with "rest": true -> sleep until earliest cooldown
             try:
                 _, _, _rest_entry = self.get_proxy_email_and_inbox()
@@ -1019,7 +1453,7 @@ class SiteBot:
                 })
             except Exception:
                 pass
-            time.sleep(2)
+            time.sleep(cfg.SLEEP_PAUSE)
             return False
         if getattr(self, "current_sim_id", None):
             sim = None
@@ -1052,43 +1486,60 @@ class SiteBot:
         pool = [c for c in candidates if not allowed or c["country"].upper() in allowed]
         if not pool:
             pool = candidates
-        pool = [c for c in pool if c["phone"] not in self.tested_numbers]
-        if not pool:
-            self.tested_numbers.clear()
-            pool = candidates
-        cand = random.choice(pool)
-        self.last_pair_number = cand.get("phone")
-        payload = {"simId": sim_id, "numberId": cand["id"], "packageId": package_id}
+        # dedicated number per bot: BOT_ID -> stable candidate, reused for every API pair
+        cand = pool[BOT_ID % len(pool)]
+        others = [c for c in pool if c["id"] != cand["id"]]
+        random.shuffle(others)
+        ordered = [cand] + others
+        log(f"[pair] dedicated number={cand['phone']} [{cand['country']}] numberId={cand['id']} (BOT_ID={BOT_ID})", "info")
+        _server_log(f"[pair] dedicated number={cand['phone']} [{cand['country']}] numberId={cand['id']}")
         pair_url = "https://scoutandrunner.com/api/scout/sessions"
-        log(f"[pair] POST {pair_url}", "info")
-        log(f"[pair] payload {json.dumps(payload)}", "info")
-        log(f"[pair] headers {{{', '.join(f'{k!r}: {v!r}' for k, v in headers.items())}}}", "info")
-        log("[pair] curl " + f"curl -X POST '{pair_url}' " +
-            " ".join(f"-H '{k}: {v}'" for k, v in headers.items()) +
-            f" -d '{json.dumps(payload)}'", "info")
-        try:
-            resp = requests.post(pair_url, json=payload, headers=headers, timeout=10)
+        busy = []
+        while True:
+            fresh = [c for c in ordered if c["phone"] not in busy]
+            if not fresh:
+                break
+            cand = fresh[0]
+            self.last_pair_number = cand.get("phone")
+            payload = {"simId": sim_id, "numberId": cand["id"], "packageId": package_id}
+            log(f"[pair] POST {pair_url}", "info")
+            log(f"[pair] payload {json.dumps(payload)}", "info")
+            _server_log(f"[pair] POST sim={sim.get('phoneNumber', sim_id[:8])} numberId={cand['id']} number={cand['phone']} pkg={package_id}")
+            log(f"[pair] headers {{{', '.join(f'{k!r}: {v!r}' for k, v in headers.items())}}}", "info")
+            log("[pair] curl " + f"curl -X POST '{pair_url}' " +
+                " ".join(f"-H '{k}: {v}'" for k, v in headers.items()) +
+                f" -d '{json.dumps(payload)}'", "info")
+            try:
+                resp = requests.post(pair_url, json=payload, headers=headers, timeout=10)
+            except Exception as e:
+                log(f"[pair] FAILED number={cand['phone']} [{cand['country']}] sim={sim.get('phoneNumber')} error={e}", "warn")
+                log(f"Error creating session: {e}", "warn")
+                _server_log(f"[pair] FAILED number={cand['phone']} sim={sim.get('phoneNumber', '?')} error={e}")
+                return False
             if resp.status_code in (200, 201):
                 log(f"Session created! SIM: {sim.get('phoneNumber', sim_id[:8])} | Number: {cand['phone']} [{cand['country']}]", "ok")
                 log(f"[pair] response {resp.status_code} {resp.text[:400]}", "info")
+                _server_log(f"[pair] OK {resp.status_code}: SIM {sim.get('phoneNumber', sim_id[:8])} paired with {cand['phone']} [{cand['country']}]")
                 self.tested_numbers.add(cand["phone"])
                 self.noted_phone_number = cand["phone"]
                 self.driver.refresh()
-                time.sleep(2)
+                time.sleep(cfg.SLEEP_PAUSE)
                 return True
-            elif resp.status_code == 409:
-                log(f"[pair] FAILED number={cand['phone']} [{cand['country']}] sim={sim.get('phoneNumber')} — session exists, trying another", "warn")
+            if resp.status_code == 409:
+                log(f"[pair] number={cand['phone']} [{cand['country']}] sim={sim.get('phoneNumber')} busy (409) - noted, trying another number id", "warn")
                 log(f"[pair] response {resp.status_code} {resp.text[:400]}", "info")
-                return False
-            else:
-                log(f"POST failed: {resp.status_code} {resp.text[:200]}", "warn")
-                log(f"[pair] FAILED number={cand['phone']} [{cand['country']}] sim={sim.get('phoneNumber')} pkg={package_id} http={resp.status_code}", "warn")
-                log(f"[pair] response {resp.status_code} {resp.text[:500]}", "info")
-                return False
-        except Exception as e:
-            log(f"[pair] FAILED number={cand['phone']} [{cand['country']}] sim={sim.get('phoneNumber')} error={e}", "warn")
-            log(f"Error creating session: {e}", "warn")
+                self.tested_numbers.add(cand["phone"])
+                busy.append(cand["phone"])
+                _server_log(f"[pair] 409 busy: {cand['phone']} [{cand['country']}] being verified by another Scout - noted, trying another number id (sim {sim.get('phoneNumber', '?')})")
+                continue
+            log(f"POST failed: {resp.status_code} {resp.text[:200]}", "warn")
+            log(f"[pair] FAILED number={cand['phone']} [{cand['country']}] sim={sim.get('phoneNumber')} pkg={package_id} http={resp.status_code}", "warn")
+            log(f"[pair] response {resp.status_code} {resp.text[:500]}", "info")
+            _server_log(f"[pair] FAILED http={resp.status_code} number={cand['phone']} sim={sim.get('phoneNumber', '?')} body={resp.text[:200]}")
             return False
+        log(f"[pair] all {len(pool)} candidate number(s) busy (409) - no pair created", "warn")
+        _server_log(f"[pair] all {len(ordered)} candidate number(s) busy (409) - no pair created (sim {sim.get('phoneNumber', '?')})")
+        return False
 
     def step_click_test_number(self, rows=None, retry_count=0, max_retries=10):
         if retry_count == 0:
@@ -1181,7 +1632,7 @@ class SiteBot:
         except StaleElementReferenceException:
             log(f"Stale element ({retry_count + 1}/{max_retries}) - retrying", "warn")
             self.tested_numbers.discard(number)
-            time.sleep(0.5)
+            time.sleep(cfg.SLEEP_SMALL)
             self.driver.refresh()
             time.sleep(fixed_delay() * 2)
             self.step_click_test_number(None, retry_count + 1, max_retries)
@@ -1215,7 +1666,7 @@ class SiteBot:
                     return el
                 except StaleElementReferenceException:
                     pass
-            time.sleep(0.3)
+            time.sleep(cfg.SLEEP_SHORT)
         return None
 
     def get_proxy_email_and_inbox(self):
@@ -1578,7 +2029,7 @@ class SiteBot:
             res = self.driver.execute_script(js)
             if res:
                 log(f"resume_test: JS clicked '{res}'", "ok")
-                time.sleep(3)
+                time.sleep(cfg.SLEEP_LONG)
                 return True
         except Exception as e:
             log(f"resume_test: JS click failed: {e}", "warn")
@@ -1589,12 +2040,12 @@ class SiteBot:
             log(f"resume_test: clicking '{btn.text[:40]}' via Selenium", "info")
             clicked = self.click(btn, label=cfg.TRIGGERS["resume_test_button"])
             log(f"resume_test: click result={clicked}", "info")
-            time.sleep(3)
+            time.sleep(cfg.SLEEP_LONG)
             return True
         log("resume_test: button not found, refreshing", "warn")
         try:
             self.driver.refresh()
-            time.sleep(2)
+            time.sleep(cfg.SLEEP_PAUSE)
         except Exception:
             pass
         return True
@@ -1641,11 +2092,11 @@ class SiteBot:
             log(f"landing_page: clicking Login element <{el.tag_name}> '{el.text[:40]}'", "info")
             if self.click(el, label="landing_login"):
                 # wait a bit for navigation to sign_in_options
-                time.sleep(1.5)
+                time.sleep(cfg.SLEEP_MED)
                 return True
             try:
                 self.driver.execute_script("arguments[0].click();", el)
-                time.sleep(1.5)
+                time.sleep(cfg.SLEEP_MED)
                 return True
             except Exception as e:
                 log(f"landing_page click fallback failed: {e}", "error")
@@ -1687,7 +2138,7 @@ class SiteBot:
         except Exception:
             pass
         # avoid spam: sleep a bit before next tick re-notifies
-        time.sleep(2)
+        time.sleep(cfg.SLEEP_WAIT)
         return True
 
     def do_confirm_session(self):
@@ -1702,13 +2153,13 @@ class SiteBot:
             btn = self.find_button_with_text(cfg.TRIGGERS["start_button"])
             if btn is not None:
                 self.click(btn, label=cfg.TRIGGERS["start_button"])
-                time.sleep(1)
+                time.sleep(cfg.SLEEP_TAP)
                 return True
             # fallback generic Start
             btn2 = self.find_button_with_text("Start")
             if btn2 is not None:
                 self.click(btn2, label="Start")
-                time.sleep(1)
+                time.sleep(cfg.SLEEP_TAP)
                 return True
             log("confirm_session: Start button not found", "warn")
             return False
@@ -1746,7 +2197,7 @@ class SiteBot:
             if inp is not None:
                 ok = self.type_into(inp, cfg.BALANCE_INPUT_VALUE, label="balance amount")
                 log(f"balance_entry: type_into result={ok} value={cfg.BALANCE_INPUT_VALUE}", "info")
-                time.sleep(1.0)
+                time.sleep(cfg.SLEEP_TAP)
             else:
                 log("balance_entry: no input found, will try Continue directly", "warn")
             # always try to click Continue even if input not found
@@ -1758,7 +2209,7 @@ class SiteBot:
                 try:
                     if btn.get_attribute("disabled"):
                         log("balance_entry: Continue disabled after typing, waiting 1s...", "warn")
-                        time.sleep(1.0)
+                        time.sleep(cfg.SLEEP_TAP)
                         # re-find in case DOM updated
                         btn2 = self.find_button_with_text(cfg.TRIGGERS["continue_button"]) or self.find_button_with_text("Continue")
                         if btn2 is not None:
@@ -1767,12 +2218,12 @@ class SiteBot:
                     pass
                 clicked = self.click(btn, label=cfg.TRIGGERS["continue_button"], testing_mode=True)
                 log(f"balance_entry: click Continue result={clicked}", "info")
-                time.sleep(0.8)
+                time.sleep(cfg.SLEEP_FAST)
                 if not clicked:
                     try:
                         self.driver.execute_script("arguments[0].click();", btn)
                         log("balance_entry: JS fallback click sent", "info")
-                        time.sleep(0.8)
+                        time.sleep(cfg.SLEEP_FAST)
                     except Exception as e:
                         log(f"balance_entry JS click failed: {e}", "warn")
                 return True
@@ -1866,12 +2317,12 @@ class SiteBot:
             btn = self.find_button_with_text("Cancel attempt")
             if btn:
                 self.click(btn, label="Cancel attempt", testing_mode=True)
-                time.sleep(1)
+                time.sleep(cfg.SLEEP_TAP)
                 textarea = self.driver.find_elements(By.CSS_SELECTOR, "textarea")
                 textarea = textarea[0] if textarea else None
                 if textarea:
                     self.type_into(textarea, "Call did not reach expected IVR", label="cancel reason")
-                    time.sleep(0.5)
+                    time.sleep(cfg.SLEEP_SMALL)
                 cancel_btn = self.find_button_with_text("Cancel test")
                 if cancel_btn:
                     self.click(cancel_btn, label="Cancel test", testing_mode=True)
@@ -1909,19 +2360,19 @@ class SiteBot:
                         self.driver.back()
                 except:
                     self.driver.back()
-            time.sleep(1.5)
+            time.sleep(cfg.SLEEP_MED)
             return
         input_el = self.driver.find_elements(By.CSS_SELECTOR, "input[type='number']")
         input_el = input_el[0] if input_el else None
         self.type_into(input_el, cfg.BALANCE_INPUT_VALUE, label="remaining balance")
-        time.sleep(1.0)
+        time.sleep(cfg.SLEEP_TAP)
         if random.random() < cfg.NOTES_CHANCE:
             note = random.choice(cfg.NOTES_POOL)
             textareas = self.driver.find_elements(By.TAG_NAME, "textarea")
             if textareas:
                 self.type_into(textareas[0], note, label="notes")
                 log(f"notes {note}")
-                time.sleep(0.5)
+                time.sleep(cfg.SLEEP_SMALL)
         btn = None
         textareas = self.driver.find_elements(By.TAG_NAME, "textarea")
         if textareas:
@@ -1968,11 +2419,11 @@ class SiteBot:
         if el is not None:
             log(f"sign_in_options: clicking '{el.text[:50]}'", "info")
             if self.click(el, label="signin_email"):
-                time.sleep(1.5)
+                time.sleep(cfg.SLEEP_MED)
                 return True
             try:
                 self.driver.execute_script("arguments[0].click();", el)
-                time.sleep(1.5)
+                time.sleep(cfg.SLEEP_MED)
                 return True
             except Exception as e:
                 log(f"sign_in_options click failed: {e}", "error")
@@ -2029,14 +2480,14 @@ class SiteBot:
             # fallback direct send_keys
             try:
                 email_input.click()
-                time.sleep(0.5)
+                time.sleep(cfg.SLEEP_SMALL)
                 email_input.clear()
                 email_input.send_keys(proxy_email)
             except Exception as e:
                 log(f"email_access: type_into failed: {e}", "error")
                 return False
 
-        time.sleep(0.8)
+        time.sleep(cfg.SLEEP_FAST)
 
         # Click Continue button - wait for OTP page
         cont_btn = None
@@ -2060,7 +2511,7 @@ class SiteBot:
             try:
                 from selenium.webdriver.common.keys import Keys
                 email_input.send_keys(Keys.ENTER)
-                time.sleep(1.5)
+                time.sleep(cfg.SLEEP_MED)
                 return True
             except Exception:
                 return False
@@ -2070,17 +2521,17 @@ class SiteBot:
             is_disabled = cont_btn.get_attribute("disabled") is not None or cont_btn.get_attribute("aria-disabled") == "true"
             if is_disabled:
                 log("email_access: Continue button disabled, waiting...", "warn")
-                time.sleep(1.5)
+                time.sleep(cfg.SLEEP_MED)
         except Exception:
             pass
 
         log(f"email_access: clicking Continue '{cont_btn.text[:30]}'", "info")
         if self.click(cont_btn, label="email_continue"):
-            time.sleep(1.5)
+            time.sleep(cfg.SLEEP_MED)
             return True
         try:
             self.driver.execute_script("arguments[0].click();", cont_btn)
-            time.sleep(1.5)
+            time.sleep(cfg.SLEEP_MED)
             return True
         except Exception as e:
             log(f"email_access: click Continue failed: {e}", "error")
@@ -2194,13 +2645,13 @@ class SiteBot:
             el = inputs[idx]
             try:
                 self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                time.sleep(0.15)
+                time.sleep(cfg.SLEEP_MICRO)
                 el.click()
-                time.sleep(0.15)
+                time.sleep(cfg.SLEEP_MICRO)
                 el.clear()
                 el.send_keys(digit)
                 log(f"otp_verification: filled input {idx+1} with {digit}", "info")
-                time.sleep(0.2)
+                time.sleep(cfg.SLEEP_TINY)
             except Exception as e:
                 log(f"otp_verification: failed to fill input {idx+1}: {e}", "error")
                 # try js fallback
@@ -2209,7 +2660,7 @@ class SiteBot:
                 except Exception:
                     pass
 
-        time.sleep(0.8)
+        time.sleep(cfg.SLEEP_FAST)
 
         # Click Continue - handle disabled button
         cont_btn = None
@@ -2234,7 +2685,7 @@ class SiteBot:
                 is_disabled = disabled_attr is not None or aria_disabled == "true" or "opacity" in cls and "cursor-not-allowed" in cls
                 if is_disabled:
                     log("otp_verification: Continue disabled, waiting 0.5s...", "warn")
-                    time.sleep(0.5)
+                    time.sleep(cfg.SLEEP_SMALL)
                     continue
                 break
             except StaleElementReferenceException:
@@ -2242,16 +2693,16 @@ class SiteBot:
                 cont_btn = self.find_button_with_text("Continue") or self._find_element(By.CSS_SELECTOR, 'button[type="submit"]')
                 if cont_btn is None:
                     break
-                time.sleep(0.3)
+                time.sleep(cfg.SLEEP_SHORT)
                 continue
 
         log(f"otp_verification: clicking Continue '{cont_btn.text[:30] if cont_btn else ''}'", "info")
         if self.click(cont_btn, label="otp_continue"):
-            time.sleep(1.5)
+            time.sleep(cfg.SLEEP_MED)
             return True
         try:
             self.driver.execute_script("arguments[0].click();", cont_btn)
-            time.sleep(1.5)
+            time.sleep(cfg.SLEEP_MED)
             return True
         except Exception as e:
             log(f"otp_verification: click Continue failed: {e}", "error")
@@ -2372,7 +2823,7 @@ class SiteBot:
             log("license_select: no license — installing hook + clicking Refresh", "warn")
             _inject_license_hook(self.driver)
             if self._click_license_refresh():
-                time.sleep(2.5)
+                time.sleep(cfg.SLEEP_BEAT)
                 candidates = self._scan_license_cards()
                 self._log_license_hook("license_select:after_refresh")
 
@@ -2423,7 +2874,7 @@ class SiteBot:
                 except Exception as e:
                     log(f"license_select: card click failed: {e}", "error")
 
-            time.sleep(0.8)
+            time.sleep(cfg.SLEEP_FAST)
 
         # Now click Continue button
         cont_btn = None
@@ -2445,27 +2896,27 @@ class SiteBot:
                 disabled = cont_btn.get_attribute("disabled") is not None or cont_btn.get_attribute("aria-disabled") == "true"
                 if disabled:
                     log("license_select: Continue disabled, waiting...", "warn")
-                    time.sleep(0.5)
+                    time.sleep(cfg.SLEEP_SMALL)
                     continue
                 break
             except StaleElementReferenceException:
                 cont_btn = self.find_button_with_text("Continue")
-                time.sleep(0.3)
+                time.sleep(cfg.SLEEP_SHORT)
                 continue
 
         log(f"license_select: clicking Continue '{cont_btn.text[:30] if cont_btn else ''}'", "info")
         if self.click(cont_btn, label="license_continue"):
-            time.sleep(1.5)
+            time.sleep(cfg.SLEEP_MED)
             try:
-                time.sleep(0.8)
+                time.sleep(cfg.SLEEP_FAST)
                 _print_create_code(self.driver)
             except: pass
             return True
         try:
             self.driver.execute_script("arguments[0].click();", cont_btn)
-            time.sleep(1.5)
+            time.sleep(cfg.SLEEP_MED)
             try:
-                time.sleep(0.8)
+                time.sleep(cfg.SLEEP_FAST)
                 _print_create_code(self.driver)
             except: pass
             return True
@@ -2493,7 +2944,7 @@ class SiteBot:
         label_alts = ["Canada", "CA -"] if code == "CA" else ["United States", "US -", "United States of America"]
         js_texts = ["Canada"] if code == "CA" else ["United States", "United States of America"]
         try:
-            time.sleep(0.8)
+            time.sleep(cfg.SLEEP_FAST)
             # 1) try JS to find clickable option directly (even without opening dropdown)
             try:
                 js = """
@@ -2516,7 +2967,7 @@ class SiteBot:
                 res = self.driver.execute_script(js)
                 if res and label in str(res):
                     log(f"_select_country: JS direct click '{res[:30]}'", "ok")
-                    time.sleep(0.8)
+                    time.sleep(cfg.SLEEP_FAST)
                     return True
             except Exception as e:
                 log(f"_select_country({code}) JS direct failed: {e}", "warn")
@@ -2547,7 +2998,7 @@ class SiteBot:
                     self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", trigger)
                 except: pass
                 self.click(trigger, label="country dropdown")
-                time.sleep(1.2)
+                time.sleep(cfg.SLEEP_STEP)
             # 3) wait for options list to appear and pick target country
             for attempt in range(3):
                 us_opt = None
@@ -2573,7 +3024,7 @@ class SiteBot:
                         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", us_opt)
                     except: pass
                     self.click(us_opt, label=f"{code} option")
-                    time.sleep(0.8)
+                    time.sleep(cfg.SLEEP_FAST)
                     # confirm selection stuck (dropdown closed)
                     try:
                         # check if trigger now shows the country
@@ -2582,7 +3033,7 @@ class SiteBot:
                             return True
                     except: pass
                     return True
-                time.sleep(0.6)
+                time.sleep(cfg.SLEEP_MED)
             log(f"_select_country({code}): {label} option not found after opening", "warn")
         except Exception as e:
             log(f"_select_country({code}) failed: {e}", "warn")
@@ -2598,16 +3049,16 @@ class SiteBot:
                 # wait if disabled
                 for _ in range(5):
                     try:
-                        if btn.get_attribute("disabled") is not None: time.sleep(0.5); continue
+                        if btn.get_attribute("disabled") is not None: time.sleep(cfg.SLEEP_SMALL); continue
                         break
                     except: break
                 self.click(btn, label=txt)
-                time.sleep(1.2)
+                time.sleep(cfg.SLEEP_STEP)
                 return True
         b = self._find_element(By.CSS_SELECTOR, 'button[type="submit"]')
         if b is not None:
             self.click(b, label="submit")
-            time.sleep(1.2)
+            time.sleep(cfg.SLEEP_STEP)
             return True
         return False
 
@@ -2616,7 +3067,7 @@ class SiteBot:
         try:
             # scroll main window
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(0.5)
+            time.sleep(cfg.SLEEP_SMALL)
             # scroll any scrollable div containing terms
             self.driver.execute_script("""
                 var els=document.querySelectorAll('div');
@@ -2628,7 +3079,7 @@ class SiteBot:
                 }
                 window.scrollTo(0, document.body.scrollHeight);
             """)
-            time.sleep(0.8)
+            time.sleep(cfg.SLEEP_FAST)
             # check "I have read and accept" checkbox
             chk = None
             for sel in ['input[type="checkbox"]', 'button[role="checkbox"]', 'div[role="checkbox"]']:
@@ -2657,7 +3108,7 @@ class SiteBot:
                             self.click(chk, label="terms checkbox")
                     else:
                         self.click(chk, label="terms checkbox")
-                    time.sleep(0.6)
+                    time.sleep(cfg.SLEEP_MED)
                 except Exception as e:
                     log(f"terms checkbox click failed: {e}", "warn")
             return True
@@ -2669,15 +3120,81 @@ class SiteBot:
         code = self._routing_country()
         log(f"STATE: country_select - selecting {code} (routing tag)", "info")
         self._select_country(code)
-        time.sleep(0.5)
+        time.sleep(cfg.SLEEP_SMALL)
         self._click_continue("Continue")
         return True
 
+    def _click_role_js(self, wanted):
+        """Exact-text click across button/a/label/div/span — role cards on /role
+        are not always <button> (bot sat on role_select clicking nothing).
+        First-line equality keeps 'ScoutQuest' nav from matching 'Scout'."""
+        try:
+            js = """
+            var wanted = %s;
+            var nodes = document.querySelectorAll('button,a,label,[role=button],div,span');
+            for (var w=0; w<wanted.length; w++) {
+              for (var i=0;i<nodes.length;i++) {
+                var el = nodes[i];
+                var t = (el.innerText||'').trim();
+                var first = t.split('\\n')[0].trim();
+                if (t !== wanted[w] && first !== wanted[w]) continue;
+                var r = el.getBoundingClientRect();
+                if (r.width < 5 || r.height < 5) continue;
+                var dis = false;
+                for (var d=el; d && d!==document; d=d.parentElement) {
+                  if (d.disabled || d.getAttribute('aria-disabled')==='true') { dis=true; break; }
+                }
+                if (dis) continue;
+                el.click();
+                return (t.length > 60 ? first : t);
+              }
+            }
+            return null;
+            """ % json.dumps(list(wanted))
+            return self.driver.execute_script(js)
+        except Exception as e:
+            log(f"_click_role_js failed: {e}", "warn")
+            return None
+
     def do_role_select(self):
         log("STATE: role_select - Continue as Scout", "info")
+        body = self.get_body_text() or ""
+        if "maximum number of scout accounts" in body.lower():
+            if not getattr(self, "_scout_limit_notified", False):
+                self._scout_limit_notified = True
+                log("role_select: blocked - max scout accounts from this network", "warn")
+                try:
+                    _post_to_server("notify.php", {
+                        "bot_id": BOT_ID,
+                        "type": "ScoutNetworkLimit",
+                        "message": f"role_select blocked: max scout accounts already registered from this network (proxy {getattr(self, 'proxy_email', '?')})",
+                        "priority": "high"
+                    })
+                except Exception:
+                    pass
+            time.sleep(cfg.SLEEP_WAIT)
+            return True
+        self._scout_limit_notified = False
         btn = self.find_button_with_text("Continue as Scout")
         if btn is None: btn = self.find_button_with_text("Scout")
-        if btn is not None: self.click(btn, label="Continue as Scout"); time.sleep(1)
+        if btn is not None:
+            self.click(btn, label="Continue as Scout"); time.sleep(cfg.SLEEP_TAP)
+            self._role_retry = 0
+        else:
+            hit = self._click_role_js(["Continue as Scout", "Scout", "Continue"])
+            if hit:
+                log(f"role_select: clicked '{hit}' via js fallback", "ok")
+                time.sleep(cfg.SLEEP_STEP)
+                self._role_retry = 0
+            else:
+                self._role_retry = getattr(self, "_role_retry", 0) + 1
+                if self._role_retry % 6 == 0 and "/role" in (self.driver.current_url or ""):
+                    log("role_select: nothing clickable for a while - reloading /role", "warn")
+                    try:
+                        self.driver.get(cfg.BASE_URL + "/role")
+                        time.sleep(cfg.SLEEP_LONG)
+                    except Exception:
+                        pass
         self._click_continue("Continue")
         return True
 
@@ -2685,10 +3202,16 @@ class SiteBot:
         code = self._routing_country()
         log(f"STATE: country_role_select - {code} + Scout (routing tag)", "info")
         self._select_country(code)
-        time.sleep(0.5)
+        time.sleep(cfg.SLEEP_SMALL)
         btn = self.find_button_with_text("Continue as Scout")
         if btn is None: btn = self.find_button_with_text("Scout")
-        if btn is not None: self.click(btn, label="Scout"); time.sleep(0.8)
+        if btn is not None:
+            self.click(btn, label="Scout"); time.sleep(cfg.SLEEP_FAST)
+        else:
+            hit = self._click_role_js(["Continue as Scout", "Scout", "Continue"])
+            if hit:
+                log(f"country_role_select: clicked '{hit}' via js fallback", "ok")
+                time.sleep(cfg.SLEEP_STEP)
         self._click_continue("Continue")
         return True
 
@@ -2723,7 +3246,7 @@ class SiteBot:
         try:
             log("no_active_license: no refresh button — reloading page (hook is CDP-registered)", "info")
             self.driver.refresh()
-            time.sleep(3)
+            time.sleep(cfg.SLEEP_LONG)
             if getattr(self, "_lic_force", False):
                 self.driver.execute_script("window.__licForceFalse = true;")
             self._click_license_refresh()
@@ -2764,11 +3287,11 @@ class SiteBot:
                 if time.time() - getattr(self, "_lic_last_hb", 0) > 30:
                     self._lic_last_hb = time.time()
                     log("no_active_license: API confirmed no licenses for this account — idling", "warn")
-                time.sleep(1)
+                time.sleep(cfg.SLEEP_TAP)
                 return False
         now = time.time()
         if now - getattr(self, "_lic_refresh_ts", 0) < 8:
-            time.sleep(1)
+            time.sleep(cfg.SLEEP_TAP)
             return False
         self._lic_refresh_ts = now
         _inject_license_hook(self.driver)
@@ -2776,7 +3299,7 @@ class SiteBot:
         if not getattr(self, "_lic_force", False):
             # Stage 1: normal query (isBound:true) — a bound license must show up unmodified.
             self._lic_do_refresh()
-            time.sleep(2.5)
+            time.sleep(cfg.SLEEP_BEAT)
             resp = self._log_license_hook("no_active_license:isBound=true")
             if resp and resp != "none" and not self._resp_is_empty(resp):
                 self._lic_empty = 0
@@ -2790,11 +3313,11 @@ class SiteBot:
                 log(f"no_active_license: force flag failed: {e}", "warn")
             log("no_active_license: empty with isBound:true — flipping request to isBound:false", "warn")
             self._lic_do_refresh()
-            time.sleep(2.5)
+            time.sleep(cfg.SLEEP_BEAT)
             resp = self._log_license_hook("no_active_license:isBound=false")
         else:
             self._lic_do_refresh()
-            time.sleep(2.5)
+            time.sleep(cfg.SLEEP_BEAT)
             resp = self._log_license_hook("no_active_license:isBound=false")
 
         if self._resp_is_empty(resp):
@@ -2849,7 +3372,7 @@ class SiteBot:
         if btn is None: btn = self.find_button_with_text("Verify")
         if btn is not None:
             self.click(btn, label="Verify my identity")
-            time.sleep(2)
+            time.sleep(cfg.SLEEP_PAUSE)
             return True
         log("verify_identity: button not found", "warn")
         return False
@@ -2857,7 +3380,7 @@ class SiteBot:
     def _do_terms(self, name):
         log(f"STATE: {name} - scrolling and accepting", "info")
         self._handle_terms_scroll_and_accept()
-        time.sleep(0.5)
+        time.sleep(cfg.SLEEP_SMALL)
         # After accepting, click Continue/Agree
         if not self._click_continue("Continue"):
             self._click_continue("Agree")
@@ -2888,7 +3411,7 @@ class SiteBot:
             self.log.error("scout_dashboard: SIMs navigation failed", details={"url": cfg.SIMS_PAGE_URL, "error": str(e)})
             return False
         # Wait 2-3 seconds for page to load (keep timing note: first OTP sometimes wrong due to timing, but success on second try - don't block login flow)
-        time.sleep(random.uniform(2, 3))
+        time.sleep(random.uniform(cfg.SLEEP_LOAD_MIN, cfg.SLEEP_LOAD_MAX))
 
         body_text = self.get_body_text()
 
@@ -2906,10 +3429,10 @@ class SiteBot:
                         continue
             if btn is not None:
                 self.click(btn, label="Start")
-                time.sleep(2)
+                time.sleep(cfg.SLEEP_PAUSE)
                 try:
                     self.driver.get(cfg.SIMS_PAGE_URL)
-                    time.sleep(2)
+                    time.sleep(cfg.SLEEP_PAUSE)
                     body_text = self.get_body_text()
                 except Exception as e:
                     log(f"scout_dashboard: failed to navigate back after onboarding: {e}", "warn")
@@ -3029,10 +3552,10 @@ class SiteBot:
             if not ok:
                 # All 8/8 or no pairs -> already emitted NoNumbersToTest high in api_pair; break loop by returning to dashboard for fresh SIM check
                 log(f"test_numbers_available: no pair created (last number tried: {getattr(self, 'last_pair_number', '?')}) -> back to dashboard for SIM re-check (throttle 8s)", "warn")
-                time.sleep(8)
+                time.sleep(cfg.SLEEP_STALL)
                 try:
                     self.driver.get(cfg.BASE_URL + "/scout")
-                    time.sleep(2)
+                    time.sleep(cfg.SLEEP_PAUSE)
                 except Exception:
                     pass
                 return True
@@ -3074,12 +3597,12 @@ class SiteBot:
             log("sims_onboarding: Start button not found", "warn")
             return False
         self.click(btn, label="Start")
-        time.sleep(2)
+        time.sleep(cfg.SLEEP_PAUSE)
         # After Start it navigates to package (Select a Plan) - go back to sims to count
         log("sims_onboarding: clicked Start, navigating back to sims to count", "info")
         try:
             self.driver.get(cfg.SIMS_PAGE_URL)
-            time.sleep(2)
+            time.sleep(cfg.SLEEP_PAUSE)
         except Exception as e:
             log(f"sims_onboarding: failed to navigate back to sims: {e}", "warn")
         return True
@@ -3088,7 +3611,7 @@ class SiteBot:
         log("STATE: sims_page - bounce to test-numbers (was looping)", "info")
         try:
             self.driver.get(cfg.TEST_NUMBERS_PAGE_URL)
-            time.sleep(1.5)
+            time.sleep(cfg.SLEEP_MED)
         except: pass
         return True
 
@@ -3123,7 +3646,7 @@ class SiteBot:
                 self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
             except Exception:
                 pass
-        time.sleep(2)
+        time.sleep(cfg.SLEEP_PAUSE)
         return True
 
     def do_runner_register_sim(self):
@@ -3137,7 +3660,7 @@ class SiteBot:
                 self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
             except Exception:
                 pass
-        time.sleep(2)
+        time.sleep(cfg.SLEEP_PAUSE)
         return True
 
     def do_runner_available_numbers(self):
@@ -3151,7 +3674,7 @@ class SiteBot:
                 self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
             except Exception:
                 pass
-        time.sleep(2)
+        time.sleep(cfg.SLEEP_PAUSE)
         return True
 
     def do_runner_call_history(self):
@@ -3165,7 +3688,7 @@ class SiteBot:
                 self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
             except Exception:
                 pass
-        time.sleep(2)
+        time.sleep(cfg.SLEEP_PAUSE)
         return True
 
     def do_runner_top_up(self):
@@ -3179,7 +3702,7 @@ class SiteBot:
                 self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
             except Exception:
                 pass
-        time.sleep(2)
+        time.sleep(cfg.SLEEP_PAUSE)
         return True
 
     def do_runner_sims_page(self):
@@ -3193,7 +3716,7 @@ class SiteBot:
                 self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
             except Exception:
                 pass
-        time.sleep(2)
+        time.sleep(cfg.SLEEP_PAUSE)
         return True
 
     def do_runner_add_sim_packages(self):
@@ -3207,7 +3730,7 @@ class SiteBot:
                 self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
             except Exception:
                 pass
-        time.sleep(2)
+        time.sleep(cfg.SLEEP_PAUSE)
         return True
 
     def do_runner_register_sim_form(self):
@@ -3221,7 +3744,7 @@ class SiteBot:
                 self.driver.get(getattr(cfg, "TEST_NUMBERS_PAGE_URL", fallback))
             except Exception:
                 pass
-        time.sleep(2)
+        time.sleep(cfg.SLEEP_PAUSE)
         return True
 
     def do_settings_page(self):
@@ -3245,14 +3768,14 @@ class SiteBot:
                 log("unknown: Session Expired detected -> navigating to landing", "warn")
                 try:
                     self.driver.get(cfg.BASE_URL)
-                    time.sleep(2)
+                    time.sleep(cfg.SLEEP_PAUSE)
                 except Exception as e:
                     log(f"Session Expired recovery get failed: {e}", "warn")
                     try:
                         self.driver.delete_all_cookies()
                         self.driver.execute_script("try{localStorage.clear()}catch(e){}; try{sessionStorage.clear()}catch(e){}")
                         self.driver.get(cfg.BASE_URL)
-                        time.sleep(2)
+                        time.sleep(cfg.SLEEP_PAUSE)
                     except Exception:
                         pass
                 return True
@@ -3355,7 +3878,7 @@ class SiteBot:
                         log("[cmd] refresh -> driver.refresh()", "info")
                         try:
                             self.driver.refresh()
-                            time.sleep(1.2)
+                            time.sleep(cfg.SLEEP_STEP)
                         except Exception as e:
                             log(f"[cmd] refresh failed: {e}", "warn")
                         try:
@@ -3397,11 +3920,11 @@ class SiteBot:
                                 if profile_btn is not None:
                                     try:
                                         self.click(profile_btn, label="profile menu for logout")
-                                        time.sleep(1)
+                                        time.sleep(cfg.SLEEP_TAP)
                                     except Exception:
                                         try:
                                             self.driver.execute_script("arguments[0].click();", profile_btn)
-                                            time.sleep(1)
+                                            time.sleep(cfg.SLEEP_TAP)
                                         except Exception:
                                             pass
                                     sign_btn = self.find_button_with_text("Sign Out")
@@ -3412,7 +3935,7 @@ class SiteBot:
                                     if sign_btn is not None:
                                         log("[cmd] LOGOUT clicking Sign Out", "info")
                                         self.click(sign_btn, label="Sign Out")
-                                        time.sleep(2)
+                                        time.sleep(cfg.SLEEP_PAUSE)
                                         signed_out = True
                                     else:
                                         log("[cmd] LOGOUT Sign Out button not found after opening menu", "warn")
@@ -3432,7 +3955,7 @@ class SiteBot:
                             # Navigate to landing
                             try:
                                 self.driver.get(cfg.BASE_URL)
-                                time.sleep(2)
+                                time.sleep(cfg.SLEEP_PAUSE)
                             except Exception as e:
                                 err_msg = str(e)
                             if wait_s > 0:
@@ -3469,7 +3992,7 @@ class SiteBot:
                                     except: pass
                                 try:
                                     self.driver.get(cfg.BASE_URL)
-                                    time.sleep(1.5)
+                                    time.sleep(cfg.SLEEP_MED)
                                 except Exception:
                                     pass
                                 if woken:
@@ -3519,6 +4042,14 @@ class SiteBot:
                                 if r.ok:
                                     for w in (r.json().get("commands") or []):
                                         low=str(w.get("cmd","")).strip().lower()
+                                        if low in ("sims_added","sims-added","sims added"):
+                                            try:
+                                                msg = self._handle_sims_added(w.get("args"))
+                                                ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                                                requests.post(ack_url, json={"command_id": w.get("id"), "status": "done", "bot_id": BOT_ID, "message": msg}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                                            except Exception as e:
+                                                log(f"[cmd] SIMS_ADDED during sleep failed: {e}", "warn")
+                                            continue
                                         if low in ("wake","wakeup","resume","register_ui","register-ui","register_via_ui"):
                                             wid = w.get("id")
                                             if low.startswith("register"):
@@ -3537,128 +4068,35 @@ class SiteBot:
                         except: pass
                         if woken: log(f"[cmd] SLEEP woken at {slept}s", "ok")
                     elif cmd_lower in ("register_ui","register-ui","register_via_ui","register via ui"):
-                        log("[cmd] REGISTER_UI via browser", "info")
+                        log("[cmd] REGISTER_UI via browser (manual button)", "info")
                         try:
-                            # ensure runner role
-                            try: self._switch_to_runner()
-                            except: pass
-                            # get sims list from args or from server sims.json via fallback
-                            sims = (args.get("sims") if isinstance(args, dict) else None) or []
-                            if not sims:
-                                # try to fetch via server
-                                try:
-                                    jd = _get_from_server(f"sims.json?bot_id={BOT_ID}")
-                                    # fallback: try to load local sims.json if available
-                                except: pass
-                            # if still empty, try local file
-                            if not sims:
-                                try:
-                                    import json as _js
-                                    with open("data/sims.json","r") as f:
-                                        data=_js.load(f)
-                                        sims=data.get(str(BOT_ID)) or data.get(f"acc{BOT_ID}") or []
-                                        # normalize to phone list
-                                        if sims and isinstance(sims[0], dict):
-                                            sims=[s.get("phoneNumber") or s.get("phone") for s in sims]
-                                except: pass
-                            if not sims:
-                                log("REGISTER_UI: no sims list", "warn")
-                            else:
-                                for phone in sims:
-                                    if isinstance(phone, dict): phone=phone.get("phoneNumber") or phone.get("phone")
-                                    if not phone: continue
-                                    log(f"REGISTER_UI: adding {phone}", "info")
-                                    try:
-                                        self.driver.get("https://scoutandrunner.com/runner/sims/add")
-                                        time.sleep(2)
-                                        # fill phone
-                                        inp=None
-                                        for sel in ['input[type="tel"]','input[placeholder*="phone" i]','input[name*="phone" i]','input']:
-                                            try:
-                                                els=self.driver.find_elements(By.CSS_SELECTOR, sel)
-                                                for el in els:
-                                                    try:
-                                                        if el.is_displayed() and el.is_enabled():
-                                                            inp=el; break
-                                                    except: continue
-                                                if inp: break
-                                            except: continue
-                                        if inp:
-                                            self.type_into(inp, phone, label="phone")
-                                            time.sleep(0.6)
-                                        # country tag from routing.json (US/CA) — set if the form exposes one
-                                        try:
-                                            _cc = self._routing_country()
-                                            log(f"REGISTER_UI: country tag {_cc}", "info")
-                                            self._select_country(_cc)
-                                        except Exception as _ce:
-                                            log(f"REGISTER_UI country select skipped: {_ce}", "warn")
-                                        # carrier/country may be auto, try to find carrier input
-                                        # Click Add/Submit
-                                        btn=self.find_button_with_text("Add SIM") or self.find_button_with_text("Add") or self.find_button_with_text("Submit") or self.find_button_with_text("Continue")
-                                        if btn:
-                                            self.click(btn, label="Add SIM")
-                                            time.sleep(3)
-                                            # handle OTP if appears
-                                            # try to fetch OTP via esimplus
-                                            try:
-                                                from utils.otp import fetch_otp_for_bot
-                                            except: fetch_otp_for_bot=None
-                                            # wait for OTP input
-                                            otp_inp=None
-                                            for _ in range(8):
-                                                try:
-                                                    otp_inp=self.driver.find_element(By.CSS_SELECTOR, 'input[placeholder*="OTP" i], input[name*="otp" i], input[maxlength="6"]')
-                                                    if otp_inp and otp_inp.is_displayed(): break
-                                                except: pass
-                                                time.sleep(1)
-                                            if otp_inp:
-                                                # fetch OTP via esimplus (reuse gmail helper? fallback to esimplus)
-                                                code=None
-                                                try:
-                                                    import requests as _req
-                                                    url=f"https://esimplus.me/api/sms-receiver/{phone.lstrip('+')}/sms?perPage=5"
-                                                    for _ in range(6):
-                                                        try:
-                                                            r=_req.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
-                                                            if r.ok:
-                                                                j=r.json()
-                                                                arr=j.get("data") or j.get("messages") or []
-                                                                if arr:
-                                                                    txt=arr[0].get("body") or arr[0].get("message") or ""
-                                                                    import re as _re
-                                                                    m=_re.search(r"\d{4,8}", txt)
-                                                                    if m: code=m.group(); break
-                                                        except: pass
-                                                        time.sleep(5)
-                                                except: pass
-                                                if code:
-                                                    self.type_into(otp_inp, code, label="otp")
-                                                    time.sleep(0.5)
-                                                    vbtn=self.find_button_with_text("Verify") or self.find_button_with_text("Submit")
-                                                    if vbtn: self.click(vbtn, label="Verify OTP"); time.sleep(2)
-                                            # check for success / already / too many
-                                            body=self.get_body_text().lower()
-                                            if "already" in body:
-                                                log(f"REGISTER_UI {phone} already in list", "warn")
-                                            elif "too many" in body:
-                                                log("REGISTER_UI too many requests, stopping", "warn")
-                                                break
-                                            elif "security" in body:
-                                                log(f"REGISTER_UI {phone} security fail", "warn")
-                                            else:
-                                                log(f"REGISTER_UI {phone} done", "ok")
-                                        else:
-                                            log(f"REGISTER_UI {phone} no Add button", "warn")
-                                    except Exception as e:
-                                        log(f"REGISTER_UI {phone} error: {e}", "warn")
-                                    time.sleep(1.5)
-                        except Exception as e:
-                            log(f"REGISTER_UI failed: {e}", "error")
-                        try:
+                            self._last_auto_add = 0
+                            self._last_add_summary = ""
+                            ok = self._auto_add_sims()
+                            msg = (getattr(self, "_last_add_summary", "")
+                                   or ("registered sim(s) via UI" if ok else "no sim added - see bot logs"))
                             ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
-                            requests.post(ack_url, json={"command_id": cmd_id, "status": "done", "bot_id": BOT_ID, "message": "register_ui done"}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
-                        except: pass
+                            requests.post(ack_url, json={"command_id": cmd_id, "status": "done", "bot_id": BOT_ID, "message": msg}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                        except Exception as e:
+                            log(f"[cmd] REGISTER_UI failed: {e}", "error")
+                            try:
+                                ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                                requests.post(ack_url, json={"command_id": cmd_id, "status": "failed", "bot_id": BOT_ID, "message": str(e)}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                            except: pass
+
+                    elif cmd_lower in ("sims_added","sims-added","sims added"):
+                        log("[cmd] SIMS_ADDED (registered outside bot)", "info")
+                        try:
+                            msg = self._handle_sims_added(args)
+                            ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                            requests.post(ack_url, json={"command_id": cmd_id, "status": "done", "bot_id": BOT_ID, "message": msg}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                        except Exception as e:
+                            log(f"[cmd] SIMS_ADDED failed: {e}", "error")
+                            try:
+                                ack_url = f"{SERVER_URL.rstrip('/')}/command_ack.php"
+                                requests.post(ack_url, json={"command_id": cmd_id, "status": "failed", "bot_id": BOT_ID, "message": str(e)}, headers={"X-Bot-Token": BOT_TOKEN}, timeout=3)
+                            except: pass
+
                     else:
                         # generic commands (PAUSE etc.) - ack as acked, let state handlers deal if needed
                         try:
@@ -3709,6 +4147,25 @@ class SiteBot:
                 self._stuck_notified = True
                 # reset timer so next notify after another thresh
                 self._last_slots_time = now
+                # recovery: bounce to dashboard or sims page (skip auth states -
+                # navigating away from a login step would lose progress)
+                auth_states = {
+                    "sign_in_options", "email_access", "otp_verification",
+                    "license_select", "country_select", "role_select",
+                    "country_role_select", "verify_identity", "identity_verified",
+                    "terms_scout_addendum", "terms_runner_addendum",
+                    "terms_privacy", "terms_service", "no_active_license",
+                    "landing_page", "suspended",
+                }
+                if state not in auth_states:
+                    try:
+                        self._stuck_bounce = getattr(self, "_stuck_bounce", 0) + 1
+                        target = cfg.SIMS_PAGE_URL if (self._stuck_bounce % 2) else (cfg.BASE_URL + "/scout")
+                        log(f"STUCK recovery -> {target}", "warn")
+                        self.driver.get(target)
+                        time.sleep(cfg.SLEEP_HOLD)
+                    except Exception as ne:
+                        log(f"stuck recovery nav failed: {ne}", "warn")
         except Exception as e:
             log(f"stuck check failed: {e}", "warn")
 
@@ -3940,6 +4397,70 @@ if (!window.__licHookInstalled) {
 """
 
 
+_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+window.chrome = window.chrome || {};
+window.chrome.runtime = window.chrome.runtime || {};
+try {
+  Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+  Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+} catch (e) {}
+"""
+
+
+def _inject_stealth(driver):
+    """Hide automation markers (navigator.webdriver, HeadlessChrome UA) so
+    reCAPTCHA does not fail the register step. Must also launch Chrome with
+    --disable-blink-features=AutomationControlled."""
+    src = _STEALTH_JS
+    src += """
+try {
+  var of = window.fetch;
+  window.fetch = function() {
+    var p = of.apply(this, arguments);
+    try {
+      var a0 = arguments[0];
+      var url = (typeof a0 === 'string') ? a0 : (a0 && a0.url) || '';
+      if (url.indexOf('/sim/register') !== -1) {
+        p.then(function(r){ try{ var c=r.clone(); c.text().then(function(t){ var out='REGRESP ' + r.status + ' ' + t.slice(0,400); console.log(out); window.__REGRESP = out; try{localStorage.setItem('__REGRESP', out);}catch(e){} }); }catch(e){} });
+      }
+    } catch(e) {}
+    return p;
+  };
+  var ox = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(m,u) {
+    this.__u = u;
+    this.addEventListener('load', function(){ try{ if ((this.__u||'').indexOf('/sim/register') !== -1) { var out='REGRESP ' + this.status + ' ' + (this.responseText||'').slice(0,400); console.log(out); window.__REGRESP = out; try{localStorage.setItem('__REGRESP', out);}catch(e){} } }catch(e){} });
+    return ox.apply(this, arguments);
+  };
+} catch(e) {}
+"""
+    try:
+        ua = driver.execute_script("return navigator.userAgent") or ""
+        if "HeadlessChrome" in ua:
+            clean = ua.replace("HeadlessChrome", "Chrome")
+            driver.execute_cdp_cmd("Network.setUserAgentOverride", {
+                "userAgent": clean,
+                "acceptLanguage": "en-US,en;q=0.9",
+                "platform": "Linux x86_64",
+            })
+            appv = clean[8:] if clean.startswith("Mozilla/") else clean
+            src += ("\ntry{Object.defineProperty(navigator,'userAgent',{get:function(){return %s;},"
+                    "configurable:true});}catch(e){}" % json.dumps(clean))
+            src += ("\ntry{Object.defineProperty(navigator,'appVersion',{get:function(){return %s;},"
+                    "configurable:true});}catch(e){}" % json.dumps(appv))
+            log("stealth: HeadlessChrome UA overridden", "info")
+    except Exception as e:
+        log(f"stealth: UA override failed: {e}", "warn")
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": src})
+        driver.execute_script(src)
+        return True
+    except Exception as e:
+        log(f"stealth inject failed: {e}", "warn")
+        return False
+
+
 def _inject_license_hook(driver):
     """Rewrite licenses_get_licenses body isBound true->false (fetch + XHR).
 
@@ -3983,14 +4504,14 @@ def _recreate_browser(driver, port):
         driver.quit()
     except Exception:
         pass
-    time.sleep(2)
+    time.sleep(cfg.SLEEP_PAUSE)
     new_driver = connect_to_chrome(port)
     if new_driver is None:
         log("browser recreate failed: no driver", "error")
         return None
     try:
         new_driver.get(cfg.BASE_URL)
-        time.sleep(3)
+        time.sleep(cfg.SLEEP_LONG)
     except Exception as e:
         log(f"relaunch navigate failed: {e}", "warn")
     log("browser recreated", "ok")
@@ -4018,7 +4539,7 @@ def _recover_browser(driver, bot, port, tries, err, max_tries):
         try:
             log(f"browser crash — session alive, reloading page ({msg})", "warn")
             driver.get(cfg.BASE_URL)
-            time.sleep(3)
+            time.sleep(cfg.SLEEP_LONG)
             driver.execute_script("return 1")
             log("page recovered without relaunch", "ok")
             return driver, bot, tries, "ok"
@@ -4028,7 +4549,7 @@ def _recover_browser(driver, bot, port, tries, err, max_tries):
     log(f"browser dead — recreate attempt {tries}/{max_tries}: {msg}", "warn")
     new_driver = _recreate_browser(driver, port)
     if new_driver is None:
-        time.sleep(10)
+        time.sleep(cfg.SLEEP_REBOOT)
         return driver, bot, tries, "retry"
     try:
         new_bot = SiteBot(new_driver)
@@ -4063,6 +4584,8 @@ def connect_to_chrome(port=None):
         try:
             driver.execute_cdp_cmd("Network.enable", {})
         except: pass
+        try: _inject_stealth(driver)
+        except: pass
         try: _inject_license_hook(driver)
         except: pass
         return driver
@@ -4077,6 +4600,8 @@ def connect_to_chrome(port=None):
     opts.add_argument("--remote-allow-origins=*")
     opts.add_argument("--no-first-run")
     opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--enable-unsafe-swiftshader")
     opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
     opts.add_argument("--user-data-dir=/tmp/chrome-bot-profile")
     try:
@@ -4085,9 +4610,11 @@ def connect_to_chrome(port=None):
             driver = webdriver.Chrome(service=service, options=opts)
         else:
             driver = webdriver.Chrome(options=opts)
-        log(f"Launched new Chrome (visible via VNC :99)", "ok")
+        log(f"Launched new Chrome (xvfb)", "ok")
         try:
             driver.execute_cdp_cmd("Network.enable", {})
+        except: pass
+        try: _inject_stealth(driver)
         except: pass
         try: _inject_license_hook(driver)
         except: pass
@@ -4165,16 +4692,16 @@ def run():
         current = (driver.current_url or "").strip()
         if "scoutandrunner.com" not in current:
             log(f"On {current or 'newtab/blank'} - waiting 5s then navigating to {cfg.BASE_URL}", "info")
-            time.sleep(5)
+            time.sleep(cfg.SLEEP_WAIT)
             driver.get(cfg.BASE_URL)
-            time.sleep(3)
+            time.sleep(cfg.SLEEP_LONG)
         else:
             switch_to_target_tab(driver, getattr(cfg, "TARGET_URL_SUBSTRING", getattr(cfg, "SITE_DOMAIN", "")))
     except Exception as e:
         log(f"Auto-load failed: {e} - trying direct get", "warn")
         try:
             driver.get(cfg.BASE_URL)
-            time.sleep(3)
+            time.sleep(cfg.SLEEP_LONG)
         except Exception:
             pass
 
@@ -4237,7 +4764,7 @@ def run():
             except Exception as ne:
                 log(f"notify post failed: {ne}", "warn")
             # Keep chrome open, sleep and retry (server can detect via logs)
-            time.sleep(5)
+            time.sleep(cfg.SLEEP_WAIT)
             continue
         except SystemExit as e:
             log(f"Exit: {e}", "warn")
@@ -4253,7 +4780,7 @@ def run():
                 if action == "giveup":
                     break
                 continue
-            time.sleep(2)
+            time.sleep(cfg.SLEEP_PAUSE)
 
     log("Bot stopped", "ok")
     try:
