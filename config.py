@@ -198,8 +198,8 @@ NEXT_DELAY_MIN = 0.06 * SPEED_MULTIPLIER
 NEXT_DELAY_MAX = 0.14 * SPEED_MULTIPLIER
 NO_SIM_TIMEOUT = 2
 
-# Human-like behavior (set HUMAN_LIKE_MODE=true to re-enable)
-HUMAN_LIKE_MODE = os.getenv("HUMAN_LIKE_MODE", "false").lower() == "true"
+# Human-like behavior — forced off for max speed (env override ignored)
+HUMAN_LIKE_MODE = False
 RANDOM_SCROLL_CHANCE = 0.05
 RANDOM_PAUSE_CHANCE = 0.04
 RANDOM_PAUSE_MIN = 0.15 * SPEED_MULTIPLIER
