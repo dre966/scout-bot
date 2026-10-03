@@ -1483,7 +1483,7 @@ class SiteBot:
             # per-bot rest: routing.json entry with "rest": true -> sleep until earliest cooldown
             try:
                 _, _, _rest_entry = self.get_proxy_email_and_inbox()
-                if _rest_entry.get("rest"):
+                if self._server_tag("rest", _rest_entry.get("rest")):
                     if self.rest_until_next_cooldown(sims_raw):
                         return False
             except Exception as _re:
@@ -1714,6 +1714,38 @@ class SiteBot:
                     pass
             time.sleep(cfg.SLEEP_SHORT)
         return None
+
+    def _server_tags(self):
+        """rest/country tags from the server (routing.php, DB-backed), cached
+        60s. None when unreachable - callers fall back to the local
+        routing.json baked into the image."""
+        now = time.time()
+        if getattr(self, "_tags_fetched", False) and now - getattr(self, "_tags_at", 0) < 60:
+            return self._tags_cache
+        tags = None
+        try:
+            resp = _get_from_server("routing.php")
+            if resp and resp.get("ok") and isinstance(resp.get("entries"), list):
+                tags = {}
+                for e in resp["entries"]:
+                    try:
+                        tags[int(e.get("id"))] = e
+                    except Exception:
+                        continue
+        except Exception:
+            tags = None
+        self._tags_cache = tags
+        self._tags_at = now
+        self._tags_fetched = True
+        return tags
+
+    def _server_tag(self, key, default=None):
+        """This bot's tag from the server; local entry value stays the
+        fallback when the fetch failed."""
+        mine = (self._server_tags() or {}).get(BOT_ID)
+        if isinstance(mine, dict) and mine.get(key) is not None:
+            return mine.get(key)
+        return default
 
     def get_proxy_email_and_inbox(self):
         """Resolve proxy_email and poll_inbox via BOT_ID / BOT_EMAIL and routing.json.
@@ -2971,10 +3003,11 @@ class SiteBot:
             return False
 
     def _routing_country(self, default="US"):
-        """Country tag from routing.json (\"country\": \"US\"|\"CA\") — used when registering."""
+        """Country tag (\"US\"|\"CA\") used when registering - server tag first,
+        local routing.json entry as fallback."""
         try:
             _, _, entry = self.get_proxy_email_and_inbox()
-            c = str((entry or {}).get("country") or "").upper()
+            c = (self._server_tag("country") or (entry or {}).get("country") or "").upper()
             if c in ("US", "CA"):
                 return c
         except Exception:
