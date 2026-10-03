@@ -73,6 +73,31 @@ def _server_log(msg):
     _post_to_server("heartbeat.php", {"bot_id": BOT_ID, "message": msg})
 
 
+_PUBLIC_IP = None
+_last_ip_fetch = [0.0]
+
+
+def get_public_ip():
+    """Egress public IP of this container. Fetched at most once/60s (throttled
+    so a flaky IP service can never block a tick), cached forever after."""
+    global _PUBLIC_IP
+    if _PUBLIC_IP:
+        return _PUBLIC_IP
+    now = time.time()
+    if now - _last_ip_fetch[0] < 60:
+        return None
+    _last_ip_fetch[0] = now
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+        try:
+            ip = requests.get(url, timeout=2).text.strip()
+            if ip and " " not in ip and len(ip) < 46:
+                _PUBLIC_IP = ip
+                return ip
+        except Exception:
+            continue
+    return None
+
+
 def _get_from_server(endpoint, params=None):
     """GET from comms server with auth. Returns parsed JSON or None on fail. No-op if SERVER_URL not set."""
     if not SERVER_URL:
@@ -4239,7 +4264,8 @@ class SiteBot:
                     "poll_inbox": _poll,
                     "state": state,
                     "sims_count": getattr(self, "stored_verification_count", 0),
-                    "current_url": self.driver.current_url if hasattr(self.driver, "current_url") else ""
+                    "current_url": self.driver.current_url if hasattr(self.driver, "current_url") else "",
+                    "ip": get_public_ip()
                 })
             except Exception as e:
                 log(f"heartbeat post failed: {e}", "warn")
@@ -4710,12 +4736,18 @@ def run():
     log(f"Bot started on port {port}", "ok")
     # register with XAMPP comms server (silent fail)
     try:
+        _ip = get_public_ip()
+        if _ip:
+            log(f"Public IP: {_ip}", "ok")
         _post_to_server("register.php", {
             "bot_id": BOT_ID,
             "proxy_email": getattr(bot, "proxy_email", None),
             "poll_inbox": getattr(bot, "poll_inbox", None),
-            "container_id": os.getenv("HOSTNAME", "bot")
+            "container_id": os.getenv("HOSTNAME", "bot"),
+            "ip": _ip
         })
+        if _ip:
+            _server_log(f"public ip {_ip}")
     except Exception as e:
         log(f"register post failed: {e}", "warn")
 
